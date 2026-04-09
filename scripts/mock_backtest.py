@@ -26,6 +26,7 @@ import json
 import re
 import sys
 from contextlib import ExitStack
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -33,6 +34,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 from freqtrade.commands.arguments import Arguments
 from freqtrade.commands.optimize_commands import setup_optimize_configuration
 from freqtrade.enums import CandleType, RunMode
+from freqtrade.exchange.exchange import Exchange
 from freqtrade.exceptions import OperationalException
 from freqtrade.optimize.backtesting import Backtesting
 
@@ -140,6 +142,24 @@ def load_exchange_info_subset(exchange_info_path: Path, pairs: list[str]) -> dic
     kept = ", ".join(sorted(subset)) if subset else "none"
     print(f"Loaded exchangeInfo symbols: {kept}")
     return subset
+
+
+def ensure_exchange_info_coverage(
+    config: dict[str, Any], exchange_info_subset: dict[str, dict[str, Any]]
+) -> None:
+    if not exchange_info_subset:
+        return
+
+    missing_pairs = [
+        pair
+        for pair in config.get("exchange", {}).get("pair_whitelist", [])
+        if pair_to_exchange_symbol(pair) not in exchange_info_subset
+    ]
+    if missing_pairs:
+        raise OperationalException(
+            "exchangeInfo is available but missing metadata for these pairs: "
+            f"{', '.join(missing_pairs)}. Update exchangeInfo or reduce the whitelist."
+        )
 
 
 def infer_strategy_from_path(strategy_path: Path) -> str | None:
@@ -274,6 +294,18 @@ def build_market_from_exchange_info(
 
     if is_futures:
         settle = settle or quote
+        # Spot exchangeInfo commonly overstates futures quantity precision.
+        # Prefer explicit futures precision fields when present, otherwise use a
+        # slightly coarser precision that matches native backtesting behavior.
+        raw_qty_precision = symbol_info.get("quantityPrecision")
+        if isinstance(raw_qty_precision, int):
+            precision_amount = raw_qty_precision
+        else:
+            precision_amount = max(precision_amount - 1, 0)
+
+        normalized_min_amount = 10 ** (-precision_amount) if precision_amount > 0 else 1
+        min_amount = max(min_amount, normalized_min_amount)
+
         return {
             "id": symbol_info.get("symbol", f"{base}_{quote}"),
             "symbol": pair,
@@ -426,39 +458,35 @@ def build_markets(
     for pair in config.get("exchange", {}).get("pair_whitelist", []):
         symbol = pair_to_exchange_symbol(pair)
         symbol_info = exchange_info_subset.get(symbol)
-        markets[pair] = (
-            build_market_from_exchange_info(pair, config, symbol_info)
-            if symbol_info
-            else build_market(pair, config)
-        )
+        if exchange_info_subset:
+            if not symbol_info:
+                raise OperationalException(
+                    f"Pair {pair} is missing from exchangeInfo metadata."
+                )
+            markets[pair] = build_market_from_exchange_info(pair, config, symbol_info)
+        else:
+            markets[pair] = build_market(pair, config)
     return markets
 
 
-def build_tickers(config: dict[str, Any]) -> dict[str, dict[str, float]]:
-    tickers = {}
-    for pair in config.get("exchange", {}).get("pair_whitelist", []):
-        tickers[pair] = {
-            "bid": 1.0,
-            "ask": 1.0,
-            "last": 1.0,
-            "quoteVolume": 1_000_000.0,
-        }
-    return tickers
-
-
 def build_exchange_options(config: dict[str, Any]) -> dict[str, Any]:
-    options = {
+    return {
         "uses_leverage_tiers": True,
     }
-    if str(config.get("trading_mode", "spot")) == "futures":
-        options.update(
-            {
-                "funding_fee_timeframe": "8h",
-                "mark_ohlcv_timeframe": "8h",
-                "mark_ohlcv_price": "mark",
-            }
-        )
-    return options
+
+
+def get_default_exchange_options(config: dict[str, Any]) -> dict[str, Any]:
+    exchange_name = str(config["exchange"]["name"])
+    exchange_class_name = exchange_name.capitalize()
+    include_futures = str(config.get("trading_mode", "spot")) == "futures"
+
+    try:
+        exchange_module = import_module(f"freqtrade.exchange.{exchange_name}")
+        exchange_class = getattr(exchange_module, exchange_class_name)
+    except (ImportError, AttributeError):
+        exchange_class = Exchange
+
+    return exchange_class.combine_ft_has(include_futures=include_futures)
 
 
 def mock_exchange_context(
@@ -470,8 +498,8 @@ def mock_exchange_context(
     if config.get("timeframe_detail"):
         timeframe_values.add(str(config["timeframe_detail"]))
     markets = build_markets(config, exchange_info_subset)
-    tickers = build_tickers(config)
     exchange_options = build_exchange_options(config)
+    default_exchange_options = get_default_exchange_options(config)
     stack = ExitStack()
 
     stack.enter_context(patch(f"{EXMS}.validate_config", MagicMock()))
@@ -501,7 +529,6 @@ def mock_exchange_context(
         )
     )
     stack.enter_context(patch(f"{EXMS}.get_fee", return_value=config.get("fee", 0.0002)))
-    stack.enter_context(patch(f"{EXMS}.get_tickers", return_value=tickers))
     stack.enter_context(patch(f"{EXMS}._init_ccxt", MagicMock()))
     stack.enter_context(
         patch(f"{EXMS}.timeframes", new_callable=PropertyMock, return_value=sorted(timeframe_values))
@@ -514,7 +541,9 @@ def mock_exchange_context(
     stack.enter_context(
         patch(
             f"{EXMS}.get_option",
-            side_effect=lambda key, default=None: exchange_options.get(key, default),
+            side_effect=lambda key, default=None: exchange_options.get(
+                key, default_exchange_options.get(key, default)
+            ),
         )
     )
 
@@ -568,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         script_args.exchange_info,
         config.get("exchange", {}).get("pair_whitelist", []),
     )
+    ensure_exchange_info_coverage(config, exchange_info_subset)
 
     with mock_exchange_context(config, exchange_info_subset):
         backtesting = Backtesting(config)
