@@ -112,3 +112,4 @@ target/
 !*.gitkeep
 
 docker-compose-*.yml
+freqtrade.egg-info/

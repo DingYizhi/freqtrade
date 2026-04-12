@@ -6,14 +6,12 @@ from pathlib import Path
 
 import ccxt
 
-from freqtrade.enums import TRADE_MODES, MarginMode, PriceType, RunMode, TradingMode
+from freqtrade.enums import MarginMode, PriceType, TradingMode
 from freqtrade.exceptions import DDosProtection, OperationalException, TemporaryError
 from freqtrade.exchange import Exchange
 from freqtrade.exchange.common import retrier
-from freqtrade.exchange.exchange_types import FtHas, Tickers
-from freqtrade.misc import deep_merge_dicts, json_load
-from freqtrade.util import FtTTLCache
-from freqtrade.util.datetime_helpers import dt_from_ts, dt_ts
+from freqtrade.exchange.exchange_types import FtHas
+from freqtrade.misc import json_load
 
 
 logger = logging.getLogger(__name__)
@@ -68,7 +66,6 @@ class Binance(Exchange):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._spot_delist_schedule_cache: FtTTLCache = FtTTLCache(maxsize=100, ttl=300)
 
     def get_proxy_coin(self) -> str:
         """
@@ -82,21 +79,6 @@ class Binance(Exchange):
                 self._config["stake_currency"],
             )  # type: ignore[return-value]
         return self._config["stake_currency"]
-
-    def get_tickers(
-        self,
-        symbols: list[str] | None = None,
-        *,
-        cached: bool = False,
-        market_type: TradingMode | None = None,
-    ) -> Tickers:
-        tickers = super().get_tickers(symbols=symbols, cached=cached, market_type=market_type)
-        if self.trading_mode == TradingMode.FUTURES:
-            # Binance's future result has no bid/ask values.
-            # Therefore we must fetch that from fetch_bids_asks and combine the two results.
-            bidsasks = self.fetch_bids_asks(symbols, cached=cached)
-            tickers = deep_merge_dicts(bidsasks, tickers, allow_null_overrides=False)
-        return tickers
 
     @retrier
     def additional_exchange_init(self) -> None:
@@ -147,27 +129,6 @@ class Binance(Exchange):
         :return: True if the date falls on a full hour, False otherwise
         """
         return open_date.minute == 0 and open_date.second < 15
-
-    def fetch_funding_rates(self, symbols: list[str] | None = None) -> dict[str, dict[str, float]]:
-        """
-        Fetch funding rates for the given symbols.
-        :param symbols: List of symbols to fetch funding rates for
-        :return: Dict of funding rates for the given symbols
-        """
-        try:
-            if self.trading_mode == TradingMode.FUTURES:
-                rates = self._api.fetch_funding_rates(symbols)
-                return rates
-            return {}
-        except ccxt.DDoSProtection as e:
-            raise DDosProtection(e) from e
-        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
-            raise TemporaryError(
-                f"Error in additional_exchange_init due to {e.__class__.__name__}. Message: {e}"
-            ) from e
-
-        except ccxt.BaseError as e:
-            raise OperationalException(e) from e
 
     def dry_run_liquidation_price(
         self,
@@ -263,132 +224,6 @@ class Binance(Exchange):
                 return self.get_leverage_tiers()
         else:
             return {}
-
-    async def _async_get_trade_history_id_startup(
-        self, pair: str, since: int
-    ) -> tuple[list[list], str]:
-        """
-        override for initial call
-
-        Binance only provides a limited set of historic trades data.
-        Using from_id=0, we can get the earliest available trades.
-        So if we don't get any data with the provided "since", we can assume to
-        download all available data.
-        """
-        t, from_id = await self._async_fetch_trades(pair, since=since)
-        if not t:
-            return [], "0"
-        return t, from_id
-
-    async def _async_get_trade_history_id(
-        self, pair: str, until: int, since: int, from_id: str | None = None
-    ) -> tuple[str, list[list]]:
-        logger.info(f"Fetching trades for {pair} from Binance, {from_id=}, {since=}, {until=}")
-        return await super()._async_get_trade_history_id(
-            pair, until=until, since=since, from_id=from_id
-        )
-
-    def _check_delisting_futures(self, pair: str) -> datetime | None:
-        delivery_time = self.markets.get(pair, {}).get("info", {}).get("deliveryDate", None)
-        if delivery_time:
-            if isinstance(delivery_time, str) and (delivery_time != ""):
-                delivery_time = int(delivery_time)
-
-            # Binance set a very high delivery time for all perpetuals.
-            # We compare with delivery time of BTC/USDT:USDT which assumed to never be delisted
-            btc_delivery_time = (
-                self.markets.get("BTC/USDT:USDT", {}).get("info", {}).get("deliveryDate", None)
-            )
-
-            if delivery_time == btc_delivery_time:
-                return None
-
-            delivery_time = dt_from_ts(delivery_time)
-
-        return delivery_time
-
-    def check_delisting_time(self, pair: str) -> datetime | None:
-        """
-        Check if the pair gonna be delisted.
-        By default, it returns None.
-        :param pair: Market symbol
-        :return: Datetime if the pair gonna be delisted, None otherwise
-        """
-        if self._config["runmode"] not in TRADE_MODES:
-            return None
-
-        if self.trading_mode == TradingMode.FUTURES:
-            return self._check_delisting_futures(pair)
-        return self._get_spot_pair_delist_time(pair, refresh=False)
-
-    def _get_spot_delist_schedule(self):
-        """
-        Get the delisting schedule for spot pairs
-        Only works in live mode as it requires API keys,
-        Return sample:
-        [{
-            "delistTime": "1759114800000",
-            "symbols": [
-                "OMNIBTC",
-                "OMNIFDUSD",
-                "OMNITRY",
-                "OMNIUSDC",
-                "OMNIUSDT"
-            ]
-        }]
-        """
-        try:
-            delist_schedule = self._api.sapi_get_spot_delist_schedule()
-            return delist_schedule
-        except ccxt.DDoSProtection as e:
-            raise DDosProtection(e) from e
-        except (ccxt.NetworkError, ccxt.OperationFailed, ccxt.ExchangeError) as e:
-            raise TemporaryError(
-                f"Could not get delist schedule {e.__class__.__name__}. Message: {e}"
-            ) from e
-        except ccxt.BaseError as e:
-            raise OperationalException(e) from e
-
-    def _get_spot_pair_delist_time(self, pair: str, refresh: bool = False) -> datetime | None:
-        """
-        Get the delisting time for a pair if it will be delisted
-        :param pair: Pair to get the delisting time for
-        :param refresh: true if you need fresh data
-        :return: int: delisting time None if not delisting
-        """
-
-        if not pair or not self._config["runmode"] == RunMode.LIVE:
-            # Endpoint only works in live mode as it requires API keys
-            return None
-
-        cache = self._spot_delist_schedule_cache
-
-        if not refresh:
-            if delist_time := cache.get(pair, None):
-                return delist_time
-
-        delist_schedule = self._get_spot_delist_schedule()
-
-        if delist_schedule is None:
-            return None
-
-        for schedule in delist_schedule:
-            delist_dt = dt_from_ts(int(schedule["delistTime"]))
-            for symbol in schedule["symbols"]:
-                ft_symbol = next(
-                    (
-                        pair
-                        for pair, market in self.markets.items()
-                        if market.get("id", None) == symbol
-                    ),
-                    None,
-                )
-                if ft_symbol is None:
-                    continue
-
-                cache[ft_symbol] = delist_dt
-
-        return cache.get(pair, None)
 
 
 class Binanceusdm(Binance):
