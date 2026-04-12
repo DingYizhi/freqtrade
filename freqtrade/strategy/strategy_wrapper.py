@@ -1,7 +1,6 @@
 import logging
 from collections.abc import Callable
 from copy import copy
-from functools import wraps
 from typing import Any, TypeVar, cast
 
 from freqtrade.exceptions import StrategyError
@@ -11,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# Cache for wrapped functions: (f, message, default_retval, supress_error) -> wrapper
+_wrapper_cache: dict[tuple, Any] = {}
 
 
 def __format_traceback(error: Exception) -> str:
@@ -34,15 +36,18 @@ def strategy_safe_wrapper(f: F, message: str = "", default_retval=None, supress_
     Caches all exceptions and returns either the default_retval (if it's not None) or raises
     a StrategyError exception, which then needs to be handled by the calling method.
     """
+    cache_key = (id(f), message, id(default_retval), supress_error)
+    cached = _wrapper_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
-    @wraps(f)
+    # Pre-compute whether this is a user strategy method (not IStrategy base)
+    is_user_method = not (getattr(f, "__qualname__", "")).startswith("IStrategy.")
+
     def wrapper(*args, **kwargs):
         try:
-            if not (getattr(f, "__qualname__", "")).startswith("IStrategy."):
-                # Don't deep-copy if the function is not implemented in the user strategy.``
-                if "trade" in kwargs:
-                    # Protect accidental modifications from within the strategy
-                    kwargs["trade"] = copy(kwargs["trade"])
+            if is_user_method and "trade" in kwargs:
+                kwargs["trade"] = copy(kwargs["trade"])
             return f(*args, **kwargs)
         except ValueError as error:
             traceback = __format_traceback(error)
@@ -60,4 +65,6 @@ def strategy_safe_wrapper(f: F, message: str = "", default_retval=None, supress_
                 raise StrategyError(str(error)) from error
             return default_retval
 
-    return cast(F, wrapper)
+    result = cast(F, wrapper)
+    _wrapper_cache[cache_key] = result
+    return result
