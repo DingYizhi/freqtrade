@@ -30,8 +30,6 @@ class FtHas(TypedDict, total=False):
     ohlcv_volume_currency: str
     ohlcv_candle_limit_per_timeframe: dict[str, int]
     always_require_api_keys: bool
-    # allow disabling of parallel download-data for specific exchanges
-    download_data_parallel_quick: bool
     # Tickers
     tickers_have_quoteVolume: bool
     tickers_have_percentage: bool
@@ -61,9 +59,6 @@ class FtHas(TypedDict, total=False):
     order_props_in_contracts: list[Literal["amount", "cost", "filled", "remaining"]]
 
     proxy_coin_mapping: dict[str, str]
-
-    # Websocket control
-    ws_enabled: bool
 
     # Delisting check
     has_delisting: bool

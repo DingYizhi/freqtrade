@@ -32,11 +32,9 @@ dependencies = [
   # from requirements.txt
   "ccxt>=4.5.4",
   "SQLAlchemy>=2.0.6",
-  "python-telegram-bot>=20.1",
   "humanize>=4.0.0",
   "cachetools",
   "requests",
-  "httpx>=0.24.1",
   "urllib3",
   "jsonschema",
   "numpy>2.0,<3.0",
@@ -44,60 +42,19 @@ dependencies = [
   "TA-Lib<0.7",
   "ft-pandas-ta",
   "technical",
-  "tabulate",
-  "pycoingecko>=3.2.0",
   "python-rapidjson",
-  "orjson",
-  "jinja2",
-  "questionary",
-  "prompt-toolkit",
   "joblib>=1.2.0",
   "rich",
   'pyarrow; platform_machine != "armv7l"',
-  "fastapi",
-  "pydantic>=2.2.0",
-  "pyjwt",
-  "websockets",
-  "uvicorn",
-  "psutil",
-  "schedule",
-  "janus",
-  "ast-comments",
-  "aiofiles",
+  "optuna>4.0.0",
   "aiohttp",
   "cryptography",
-  "sdnotify",
   "python-dateutil",
   "pytz",
   "packaging",
-  "freqtrade-client",
 ]
 
 [project.optional-dependencies]
-# Requirements used for submodules
-plot = ["plotly>=4.0"]
-hyperopt = [
-  "cmaes",
-  "filelock",
-  "optuna > 4.0.0",
-  "scikit-learn",
-  "scipy",
-]
-freqai = [
-  "datasieve>=0.1.5",
-  "joblib",
-  "lightgbm",
-  "scikit-learn",
-  "tensorboard",
-  "xgboost",
-]
-freqai_rl = [
-  "gymnasium",
-  "sb3-contrib; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-  "stable-baselines3; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-  "torch; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-  "tqdm",
-]
 develop = [
   "mypy",
   "pre-commit",
@@ -109,35 +66,21 @@ develop = [
   "pytest-xdist",
   "pytest",
   "ruff",
-  "scipy-stubs",
   "time-machine",
   "types-cachetools",
   "types-filelock",
   "types-python-dateutil",
   "types-requests",
-  "types-tabulate",
-]
-jupyter = [
-  "ipykernel",
-  "jupyter",
-  "nbconvert",
-  "nbstripout",
-]
-all = [
-  "freqtrade[plot,hyperopt,freqai,freqai_rl,jupyter]",
 ]
 dev = [
-  "freqtrade[all,develop]",
+  "freqtrade[develop]",
 ]
 
 [project.urls]
 Homepage = "https://github.com/freqtrade/freqtrade"
-Documentation = "https://freqtrade.io"
 "Bug Tracker" = "https://github.com/freqtrade/freqtrade/issues"
 
 
-[project.scripts]
-freqtrade = "freqtrade.main:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -166,7 +109,6 @@ namespace_packages = false
 warn_unused_ignores = true
 exclude = [
     '^build_helpers\.py$',
-    '^ft_client/build/.*$',
 ]
 plugins = [
   "sqlalchemy.ext.mypy.plugin"
@@ -178,21 +120,18 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
-  "freqtrade.templates.*",
   "tests.strategy.strats"
 ]
 # Disable attr-defined check due to ta-lib not having type stubs
 disable_error_code = "attr-defined"
 
 [tool.pyright]
-include = ["freqtrade", "ft_client"]
+include = ["freqtrade"]
 exclude = [
   "**/__pycache__",
   "build_helpers/*.py",
-  "ft_client/build/*",
   "build/*",
 ]
-ignore = ["freqtrade/vendor/**"]
 pythonPlatform = "All"
 pythonVersion = "3.11"
 
@@ -283,17 +222,12 @@ max-complexity = 12
   "RUF100",  # Allow unused noqa
 ]
 
-"ft_client/test_client/**.py" = [
-  "S101",  # allow assert in tests
-]
-
 [tool.ruff.lint.flake8-bugbear]
 # Allow default arguments like, e.g., `data: List[str] = fastapi.Query(None)`.
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
-known-first-party = ["freqtrade_client"]
 
 [tool.flake8]
 # Default from https://flake8.pycqa.org/en/latest/user/options.html#cmdoption-flake8-ignore
@@ -312,4 +246,4 @@ exclude = [
 
 [tool.codespell]
 ignore-words-list = "coo,fo,strat,zar,selectin"
-skip="*.svg,./user_data,freqtrade/rpc/api_server/ui/installed,freqtrade/exchange/*.json"
+skip="*.svg,./user_data,freqtrade/exchange/*.json"

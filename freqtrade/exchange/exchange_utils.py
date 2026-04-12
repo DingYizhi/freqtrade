@@ -51,7 +51,11 @@ def available_exchanges(ccxt_module: CcxtModuleType | None = None) -> list[str]:
     Return exchanges available to the bot, i.e. non-bad exchanges in the ccxt list
     """
     exchanges = ccxt_exchanges(ccxt_module)
-    return [x for x in exchanges if validate_exchange(x)[0]]
+    return [
+        x
+        for x in exchanges
+        if MAP_EXCHANGE_CHILDCLASS.get(x, x).lower() in SUPPORTED_EXCHANGES and validate_exchange(x)[0]
+    ]
 
 
 def _exchange_has_helper(ex_mod: ccxt.Exchange, required: dict[str, list[str]]) -> list[str]:

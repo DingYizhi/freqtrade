@@ -67,7 +67,6 @@ from freqtrade.persistence import (
     enable_database_use,
 )
 from freqtrade.plugins.pairlistmanager import PairListManager
-from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
 from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy.strategy_wrapper import strategy_safe_wrapper
@@ -147,11 +146,6 @@ class Backtesting:
         self.dataprovider = DataProvider(self.config, self.exchange)
 
         if self.config.get("strategy_list"):
-            if self.config.get("freqai", {}).get("enabled", False):
-                logger.warning(
-                    "Using --strategy-list with FreqAI REQUIRES all strategies "
-                    "to have identical feature_engineering_* functions."
-                )
             for strat in list(self.config["strategy_list"]):
                 stratconf = deepcopy(self.config)
                 stratconf["strategy"] = strat
@@ -175,22 +169,14 @@ class Backtesting:
         self.disable_database_use()
         self.init_backtest_detail()
         self.pairlists = PairListManager(self.exchange, self.config, self.dataprovider)
-        self._validate_pairlists_for_backtesting()
-
         self.dataprovider.add_pairlisthandler(self.pairlists)
-        self.dynamic_pairlist: bool = self.config.get("enable_dynamic_pairlist", False)
-        self.pairlists.refresh_pairlist(only_first=self.dynamic_pairlist)
+        self.pairlists.refresh_pairlist()
 
         if len(self.pairlists.whitelist) == 0:
             raise OperationalException("No pair in whitelist.")
         self.set_fee()
         self.precision_mode = self.exchange.precisionMode
         self.precision_mode_price = self.exchange.precision_mode_price
-
-        if self.config.get("freqai_backtest_live_models", False):
-            from freqtrade.freqai.utils import get_timerange_backtest_live_models
-
-            self.config["timerange"] = get_timerange_backtest_live_models(self.config)
 
         self.timerange = TimeRange.parse_timerange(
             None if self.config.get("timerange") is None else str(self.config.get("timerange"))
@@ -203,31 +189,14 @@ class Backtesting:
         # Add maximum startup candle count to configuration for informative pairs support
         self.config["startup_candle_count"] = self.required_startup
 
-        if self.config.get("freqai", {}).get("enabled", False):
-            # For FreqAI, increase the required_startup to includes the training data
-            # This value should NOT be written to startup_candle_count
-            self.required_startup = self.dataprovider.get_required_startup(self.timeframe)
-
         self.trading_mode: TradingMode = self.config.get("trading_mode", TradingMode.SPOT)
         self.margin_mode: MarginMode = self.config.get("margin_mode", MarginMode.ISOLATED)
         # strategies which define "can_short=True" will fail to load in Spot mode.
         self._can_short = self.trading_mode != TradingMode.SPOT
         self._position_stacking: bool = self.config.get("position_stacking", False)
-        self.enable_protections: bool = self.config.get("enable_protections", False)
         migrate_data(config, self.exchange)
 
         self.init_backtest()
-
-    def _validate_pairlists_for_backtesting(self):
-        if "VolumePairList" in self.pairlists.name_list:
-            raise OperationalException(
-                "VolumePairList not allowed for backtesting. Please use StaticPairList instead."
-            )
-
-        if len(self.strategylist) > 1 and "PrecisionFilter" in self.pairlists.name_list:
-            raise OperationalException(
-                "PrecisionFilter not allowed for backtesting multiple strategies."
-            )
 
     def log_once(self, msg: str) -> None:
         """
@@ -275,7 +244,7 @@ class Backtesting:
         self.futures_data: dict[str, DataFrame] = {}
 
     def init_backtest(self):
-        self.reset_backtest(False)
+        self.reset_backtest()
 
         self.wallets = Wallets(self.config, self.exchange, is_backtest=True)
         self.starting_balance = self.wallets.get_starting_balance()
@@ -299,10 +268,6 @@ class Backtesting:
         self._can_short = self.trading_mode != TradingMode.SPOT and strategy.can_short
 
         self.strategy.ft_bot_start()
-
-    def _load_protections(self, strategy: IStrategy):
-        if self.config.get("enable_protections", False):
-            self.protections = ProtectionManager(self.config, strategy.protections)
 
     def load_bt_data(self) -> tuple[dict[str, DataFrame], TimeRange]:
         """
@@ -433,7 +398,7 @@ class Backtesting:
     def disable_database_use(self):
         disable_database_use(self.timeframe)
 
-    def reset_backtest(self, enable_protections: bool = False):
+    def reset_backtest(self):
         """
         Backtesting setup method - called once for every call to "backtest()".
         """
@@ -452,8 +417,6 @@ class Backtesting:
         self.canceled_exit_orders = 0
         self.replaced_exit_orders = 0
         self.dataprovider.clear_cache()
-        if enable_protections:
-            self._load_protections(self.strategy)
 
     def check_abort(self):
         """
@@ -1273,9 +1236,7 @@ class Backtesting:
         return None
 
     def run_protections(self, pair: str, current_time: datetime, side: LongShort):
-        if self.enable_protections:
-            self.protections.stop_per_pair(pair, current_time, side, self.starting_balance)
-            self.protections.global_stop(current_time, side, self.starting_balance)
+        return None
 
     def manage_open_orders(self, trade: LocalTrade, current_time: datetime, row: tuple) -> bool:
         """
@@ -1590,10 +1551,6 @@ class Backtesting:
             # Loop for each main candle.
             self.check_abort()
 
-            if self.dynamic_pairlist and self.pairlists:
-                self.pairlists.refresh_pairlist(pairs=self.available_pairs)
-                pairs = self.pairlists.whitelist
-
             # Reset open trade count for this candle
             # Critical to avoid exceeding max_open_trades in backtesting
             # when timeframe-detail is used and trades close within the opening candle.
@@ -1696,7 +1653,7 @@ class Backtesting:
         :param end_date: backtesting timerange end datetime
         :return: DataFrame with trades (results of backtesting)
         """
-        self.reset_backtest(self.enable_protections)
+        self.reset_backtest()
         # Ensure wallets are up-to-date (important for --strategy-list)
         self.wallets.update()
         # Use dict of lists with data for performance

@@ -9,7 +9,6 @@ from datetime import UTC, datetime, timedelta
 from math import isinf, isnan
 
 from pandas import DataFrame
-from pydantic import ValidationError
 
 from freqtrade.configuration import TimeRange
 from freqtrade.constants import CUSTOM_TAG_MAX_LENGTH, Config, IntOrInf, ListPairsWithTimeframes
@@ -29,7 +28,6 @@ from freqtrade.enums import (
 )
 from freqtrade.exceptions import OperationalException, StrategyError
 from freqtrade.exchange import timeframe_to_minutes, timeframe_to_next_date, timeframe_to_seconds
-from freqtrade.ft_types import AnnotationType
 from freqtrade.misc import remove_entry_exit_signals
 from freqtrade.persistence import Order, PairLocks, Trade
 from freqtrade.strategy.hyper import HyperStrategyMixin
@@ -46,6 +44,14 @@ from freqtrade.wallets import Wallets
 
 
 logger = logging.getLogger(__name__)
+
+
+class _RemovedFreqAI:
+    def start(self, *args, **kwargs):
+        raise OperationalException("FreqAI support has been removed from this backtesting fork.")
+
+    def shutdown(self, *args, **kwargs):
+        pass
 
 
 class IStrategy(ABC, HyperStrategyMixin):
@@ -140,9 +146,6 @@ class IStrategy(ABC, HyperStrategyMixin):
     __source__: str = ""
     __file__: str = ""
 
-    # Definition of plot_config. See plotting documentation for more details.
-    plot_config: dict = {}
-
     # A self set parameter that represents the market direction. filled from configuration
     market_direction: MarketDirection = MarketDirection.NONE
 
@@ -151,6 +154,8 @@ class IStrategy(ABC, HyperStrategyMixin):
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.freqai = _RemovedFreqAI()
+        self.freqai_info: dict = {}
         # Dict to determine if analysis is necessary
         self.__last_candle_seen_per_pair: dict[str, datetime] = {}
         super().__init__(config)
@@ -177,35 +182,13 @@ class IStrategy(ABC, HyperStrategyMixin):
                 self._ft_informative.append((informative_data, cls_method))
 
     def load_freqAI_model(self) -> None:
-        if self.config.get("freqai", {}).get("enabled", False):
-            # Import here to avoid importing this if freqAI is disabled
-            from freqtrade.freqai.utils import download_all_data_for_training
-            from freqtrade.resolvers.freqaimodel_resolver import FreqaiModelResolver
-
-            self.freqai = FreqaiModelResolver.load_freqaimodel(self.config)
-            self.freqai_info = self.config["freqai"]
-
-            # download the desired data in dry/live
-            if self.config.get("runmode") in (RunMode.DRY_RUN, RunMode.LIVE):
-                logger.info(
-                    "Downloading all training data for all pairs in whitelist and "
-                    "corr_pairlist, this may take a while if the data is not "
-                    "already on disk."
-                )
-                download_all_data_for_training(self.dp, self.config)
-        else:
-            # Gracious failures if freqAI is disabled but "start" is called.
-            class DummyClass:
-                def start(self, *args, **kwargs):
-                    raise OperationalException(
-                        "freqAI is not enabled. "
-                        "Please enable it in your config to use this strategy."
-                    )
-
-                def shutdown(self, *args, **kwargs):
-                    pass
-
-            self.freqai = DummyClass()  # type: ignore
+        if self.config.get("freqai", {}).get("enabled", False) or any(
+            self.config.get(key)
+            for key in ("freqaimodel", "freqaimodel_path", "freqai_backtest_live_models")
+        ):
+            raise OperationalException(
+                "FreqAI support has been removed from this backtesting fork."
+            )
 
     def ft_bot_start(self, **kwargs) -> None:
         """
@@ -868,24 +851,6 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         return None
 
-    def plot_annotations(
-        self, pair: str, start_date: datetime, end_date: datetime, dataframe: DataFrame, **kwargs
-    ) -> list[AnnotationType]:
-        """
-        Retrieve area annotations for a chart.
-        Must be returned as array, with type, label, color, start, end, y_start, y_end.
-        All settings except for type are optional - though it usually makes sense to include either
-        "start and end" or "y_start and y_end" for either horizontal or vertical plots
-        (or all 4 for boxes).
-        :param pair: Pair that's currently analyzed
-        :param start_date: Start date of the chart data being requested
-        :param end_date: End date of the chart data being requested
-        :param dataframe: DataFrame with the analyzed data for the chart
-        :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
-        :return: List of AnnotationType objects
-        """
-        return []
-
     def populate_any_indicators(
         self,
         pair: str,
@@ -1057,22 +1022,6 @@ class IStrategy(ABC, HyperStrategyMixin):
             stake_amount = resp
         return stake_amount, order_tag
 
-    def __informative_pairs_freqai(self) -> ListPairsWithTimeframes:
-        """
-        Create informative-pairs needed for FreqAI
-        """
-        if self.config.get("freqai", {}).get("enabled", False):
-            whitelist_pairs = self.dp.current_whitelist()
-            candle_type = self.config.get("candle_type_def", CandleType.SPOT)
-            corr_pairs = self.config["freqai"]["feature_parameters"]["include_corr_pairlist"]
-            informative_pairs = []
-            for tf in self.config["freqai"]["feature_parameters"]["include_timeframes"]:
-                for pair in set(whitelist_pairs + corr_pairs):
-                    informative_pairs.append((pair, tf, candle_type))
-            return informative_pairs
-
-        return []
-
     def gather_informative_pairs(self) -> ListPairsWithTimeframes:
         """
         Internal method which gathers all informative pairs (user or automatically defined).
@@ -1118,7 +1067,6 @@ class IStrategy(ABC, HyperStrategyMixin):
             else:
                 for pair in self.dp.current_whitelist():
                     informative_pairs.append((pair, inf_data.timeframe, candle_type))
-        informative_pairs.extend(self.__informative_pairs_freqai())
         return list(set(informative_pairs))
 
     def get_strategy_name(self) -> str:
@@ -1852,34 +1800,3 @@ class IStrategy(ABC, HyperStrategyMixin):
             df = df.rename({"sell": "exit_long"}, axis="columns")
         return df
 
-    def ft_plot_annotations(self, pair: str, dataframe: DataFrame) -> list[AnnotationType]:
-        """
-        Internal wrapper around plot_dataframe
-        """
-        if len(dataframe) > 0:
-            annotations = strategy_safe_wrapper(self.plot_annotations)(
-                pair=pair,
-                dataframe=dataframe,
-                start_date=dataframe.iloc[0]["date"].to_pydatetime(),
-                end_date=dataframe.iloc[-1]["date"].to_pydatetime(),
-            )
-
-            from freqtrade.ft_types.plot_annotation_type import AnnotationTypeTA
-
-            annotations_new: list[AnnotationType] = []
-            for annotation in annotations:
-                if isinstance(annotation, dict):
-                    # Convert to AnnotationType
-                    try:
-                        # "forbid" extra fields to catch user errors
-                        # Can be questioned if this creates many problems
-                        AnnotationTypeTA.validate_python(annotation, extra="forbid")
-                        annotations_new.append(annotation)
-                    except ValidationError as e:
-                        logger.error(f"Invalid annotation data: {annotation}. Error: {e}")
-                else:
-                    # Already an AnnotationType
-                    annotations_new.append(annotation)
-
-            return annotations_new
-        return []

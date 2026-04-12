@@ -100,44 +100,6 @@ def get_latest_backtest_filename(directory: Path | str) -> str:
     return get_latest_optimize_filename(directory, "backtest")
 
 
-def get_latest_hyperopt_filename(directory: Path | str) -> str:
-    """
-    Get latest hyperopt export based on '.last_result.json'.
-    :param directory: Directory to search for last result
-    :return: string containing the filename of the latest hyperopt result
-    :raises: ValueError in the following cases:
-        * Directory does not exist
-        * `directory/.last_result.json` does not exist
-        * `directory/.last_result.json` has the wrong content
-    """
-    try:
-        return get_latest_optimize_filename(directory, "hyperopt")
-    except ValueError:
-        # Return default (legacy) pickle filename
-        return "hyperopt_results.pickle"
-
-
-def get_latest_hyperopt_file(directory: Path | str, predef_filename: str | None = None) -> Path:
-    """
-    Get latest hyperopt export based on '.last_result.json'.
-    :param directory: Directory to search for last result
-    :return: string containing the filename of the latest hyperopt result
-    :raises: ValueError in the following cases:
-        * Directory does not exist
-        * `directory/.last_result.json` does not exist
-        * `directory/.last_result.json` has the wrong content
-    """
-    if isinstance(directory, str):
-        directory = Path(directory)
-    if predef_filename:
-        if Path(predef_filename).is_absolute():
-            raise ConfigurationError(
-                "--hyperopt-filename expects only the filename, not an absolute path."
-            )
-        return directory / predef_filename
-    return directory / get_latest_hyperopt_filename(directory)
-
-
 def load_backtest_metadata(filename: Path | str) -> dict[str, Any]:
     """
     Read metadata dictionary from backtest results file without reading and deserializing entire

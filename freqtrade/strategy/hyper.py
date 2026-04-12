@@ -11,8 +11,8 @@ from pathlib import Path
 from freqtrade.constants import Config
 from freqtrade.exceptions import DependencyException, OperationalException
 from freqtrade.misc import deep_merge_dicts
-from freqtrade.optimize.hyperopt_tools import HyperoptTools
 from freqtrade.strategy.parameters import BaseParameter
+from freqtrade.strategy.param_tools import load_strategy_params, space_is_active
 
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,7 @@ class HyperStrategyMixin:
         if filename.is_file():
             logger.info(f"Loading parameters from file {filename}")
             try:
-                params = HyperoptTools.load_params(filename)
+                params = load_strategy_params(filename)
                 if params.get("strategy_name") != self.__class__.__name__:
                     raise OperationalException("Invalid parameter file provided.")
                 return params
@@ -129,7 +129,7 @@ class HyperStrategyMixin:
             logger.info(f"No params for {space} found, using default values.")
 
         for param_name, param in params.items():
-            param.in_space = hyperopt and HyperoptTools.has_space(self.config, space)
+            param.in_space = hyperopt and space_is_active(self.config, space)
             if not param.space:
                 param.space = space
 

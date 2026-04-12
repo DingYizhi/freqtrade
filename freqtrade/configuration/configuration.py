@@ -12,7 +12,6 @@ from typing import Any
 from freqtrade import constants
 from freqtrade.configuration.deprecated_settings import process_temporary_deprecated_settings
 from freqtrade.configuration.directory_operations import create_datadir, create_userdata_dir
-from freqtrade.configuration.environment_vars import environment_vars_to_dict
 from freqtrade.configuration.load_config import load_file, load_from_files
 from freqtrade.constants import Config
 from freqtrade.enums import (
@@ -29,6 +28,8 @@ from freqtrade.misc import deep_merge_dicts, parse_db_uri_for_logging, safe_valu
 
 
 logger = logging.getLogger(__name__)
+
+NO_ENV_MERGE_COMMANDS = {"backtesting-show"}
 
 
 class Configuration:
@@ -76,13 +77,6 @@ class Configuration:
         # Load all configs
         config: Config = load_from_files(self.args.get("config", []))
 
-        # Load environment variables
-        from freqtrade.commands.arguments import NO_CONF_ALLOWED
-
-        if self.args.get("command") not in NO_CONF_ALLOWED:
-            env_data = environment_vars_to_dict()
-            config = deep_merge_dicts(env_data, config)
-
         # Normalize config
         if "internals" not in config:
             config["internals"] = {}
@@ -105,14 +99,6 @@ class Configuration:
         self._process_data_options(config)
 
         self._process_analyze_options(config)
-
-        self._process_freqai_options(config)
-
-        # Import check_exchange here to avoid import cycle problems
-        from freqtrade.exchange.check_exchange import check_exchange
-
-        # Check if the exchange set by the user is supported
-        check_exchange(config, config.get("experimental", {}).get("block_bad_exchanges", True))
 
         self._resolve_pairs_list(config)
 
@@ -259,18 +245,6 @@ class Configuration:
             logstring="Parameter --enable-position-stacking detected ...",
         )
 
-        self._args_to_config(
-            config,
-            argname="enable_protections",
-            logstring="Parameter --enable-protections detected, enabling Protections ...",
-        )
-
-        self._args_to_config(
-            config,
-            argname="enable_dynamic_pairlist",
-            logstring="Parameter --enable-dynamic-pairlist detected, enabling dynamic pairlist ...",
-        )
-
         if self.args.get("max_open_trades"):
             config.update({"max_open_trades": self.args["max_open_trades"]})
             logger.info(
@@ -334,63 +308,8 @@ class Configuration:
             ("export", "Parameter --export detected: {} ..."),
             ("backtest_breakdown", "Parameter --breakdown detected ..."),
             ("backtest_cache", "Parameter --cache={} detected ..."),
-            ("disableparamexport", "Parameter --disableparamexport detected: {} ..."),
-            ("freqai_backtest_live_models", "Parameter --freqai-backtest-live-models detected ..."),
             ("backtest_notes", "Parameter --notes detected: {} ..."),
         ]
-        self._args_to_config_loop(config, configurations)
-
-        # Hyperopt section
-
-        configurations = [
-            ("hyperopt_path", "Using additional Hyperopt lookup path: {}"),
-            ("hyperoptexportfilename", "Using hyperopt file: {}"),
-            ("lookahead_analysis_exportfilename", "Saving lookahead analysis results into {} ..."),
-            ("epochs", "Parameter --epochs detected ... Will run Hyperopt with for {} epochs ..."),
-            ("spaces", "Parameter -s/--spaces detected: {}"),
-            ("analyze_per_epoch", "Parameter --analyze-per-epoch detected."),
-            ("print_all", "Parameter --print-all detected ..."),
-        ]
-        self._args_to_config_loop(config, configurations)
-        es_epochs = self.args.get("early_stop", 0)
-        if es_epochs > 0:
-            if es_epochs < 20:
-                logger.warning(
-                    f"Early stop epochs {es_epochs} lower than 20. It will be replaced with 20."
-                )
-                config.update({"early_stop": 20})
-            else:
-                config.update({"early_stop": self.args["early_stop"]})
-            logger.info(
-                f"Parameter --early-stop detected ... Will early stop hyperopt if no improvement "
-                f"after {config.get('early_stop')} epochs ..."
-            )
-
-        configurations = [
-            ("print_json", "Parameter --print-json detected ..."),
-            ("export_csv", "Parameter --export-csv detected: {}"),
-            ("hyperopt_jobs", "Parameter -j/--job-workers detected: {}"),
-            ("hyperopt_random_state", "Parameter --random-state detected: {}"),
-            ("hyperopt_min_trades", "Parameter --min-trades detected: {}"),
-            ("hyperopt_loss", "Using Hyperopt loss class name: {}"),
-            ("hyperopt_show_index", "Parameter -n/--index detected: {}"),
-            ("hyperopt_list_best", "Parameter --best detected: {}"),
-            ("hyperopt_list_profitable", "Parameter --profitable detected: {}"),
-            ("hyperopt_list_min_trades", "Parameter --min-trades detected: {}"),
-            ("hyperopt_list_max_trades", "Parameter --max-trades detected: {}"),
-            ("hyperopt_list_min_avg_time", "Parameter --min-avg-time detected: {}"),
-            ("hyperopt_list_max_avg_time", "Parameter --max-avg-time detected: {}"),
-            ("hyperopt_list_min_avg_profit", "Parameter --min-avg-profit detected: {}"),
-            ("hyperopt_list_max_avg_profit", "Parameter --max-avg-profit detected: {}"),
-            ("hyperopt_list_min_total_profit", "Parameter --min-total-profit detected: {}"),
-            ("hyperopt_list_max_total_profit", "Parameter --max-total-profit detected: {}"),
-            ("hyperopt_list_min_objective", "Parameter --min-objective detected: {}"),
-            ("hyperopt_list_max_objective", "Parameter --max-objective detected: {}"),
-            ("hyperopt_list_no_details", "Parameter --no-details detected: {}"),
-            ("hyperopt_show_no_header", "Parameter --no-header detected: {}"),
-            ("hyperopt_ignore_missing_space", "Parameter --ignore-missing-space detected: {}"),
-        ]
-
         self._args_to_config_loop(config, configurations)
 
     def _process_plot_options(self, config: Config) -> None:
@@ -402,15 +321,9 @@ class Configuration:
             ("plot_limit", "Limiting plot to: {}"),
             ("plot_auto_open", "Parameter --auto-open detected."),
             ("trade_source", "Using trades from: {}"),
-            ("prepend_data", "Prepend detected. Allowing data prepending."),
             ("erase", "Erase detected. Deleting existing data."),
             ("no_trades", "Parameter --no-trades detected."),
             ("timeframes", "timeframes --timeframes: {}"),
-            ("days", "Detected --days: {}"),
-            ("include_inactive", "Detected --include-inactive-pairs: {}"),
-            ("no_parallel_download", "Detected --no-parallel-download: {}"),
-            ("download_trades", "Detected --dl-trades: {}"),
-            ("convert_trades", "Detected --convert: {} - Converting trade data to OHLCV."),
             ("dataformat_ohlcv", 'Using "{}" to store OHLCV data.'),
             ("dataformat_trades", 'Using "{}" to store trades data.'),
             ("show_timerange", "Detected --show-timerange"),
@@ -418,9 +331,6 @@ class Configuration:
         self._args_to_config_loop(config, configurations)
 
     def _process_data_options(self, config: Config) -> None:
-        self._args_to_config(
-            config, argname="new_pairs_days", logstring="Detected --new-pairs-days: {}"
-        )
         self._args_to_config(
             config, argname="trading_mode", logstring="Detected --trading-mode: {}"
         )
@@ -473,17 +383,6 @@ class Configuration:
             logger.info(f"Runmode set to {self.runmode.value}.")
 
         config.update({"runmode": self.runmode})
-
-    def _process_freqai_options(self, config: Config) -> None:
-        self._args_to_config(
-            config, argname="freqaimodel", logstring="Using freqaimodel class name: {}"
-        )
-
-        self._args_to_config(
-            config, argname="freqaimodel_path", logstring="Using freqaimodel path: {}"
-        )
-
-        return
 
     def _args_to_config(
         self,

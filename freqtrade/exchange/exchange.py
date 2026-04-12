@@ -6,7 +6,6 @@ Cryptocurrency Exchanges support
 import asyncio
 import inspect
 import logging
-import signal
 from collections.abc import Coroutine, Generator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -99,7 +98,6 @@ from freqtrade.exchange.exchange_utils_timeframe import (
     timeframe_to_prev_date,
     timeframe_to_seconds,
 )
-from freqtrade.exchange.exchange_ws import ExchangeWS
 from freqtrade.misc import (
     chunks,
     deep_merge_dicts,
@@ -109,7 +107,7 @@ from freqtrade.misc import (
     safe_value_nested,
 )
 from freqtrade.util import FtTTLCache, PeriodicCache, dt_from_ts, dt_now
-from freqtrade.util.datetime_helpers import dt_humanize_delta, dt_ts, format_ms_time
+from freqtrade.util.datetime_helpers import dt_humanize_delta, dt_ts
 
 
 logger = logging.getLogger(__name__)
@@ -139,7 +137,6 @@ class Exchange:
         "ohlcv_has_history": True,  # Some exchanges (Kraken) don't provide history via ohlcv
         "ohlcv_partial_candle": True,
         "ohlcv_require_since": False,
-        "download_data_parallel_quick": True,
         "always_require_api_keys": False,  # purge API keys for Dry-run. Must default to false.
         # Check https://github.com/ccxt/ccxt/issues/10767 for removal of ohlcv_volume_currency
         "ohlcv_volume_currency": "base",  # "base" or "quote"
@@ -165,8 +162,6 @@ class Exchange:
         "marketOrderRequiresPrice": False,
         "exchange_has_overrides": {},  # Dictionary overriding ccxt's "has".
         "proxy_coin_mapping": {},  # Mapping for proxy coins
-        # Expected to be in the format {"fetchOHLCV": True} or {"fetchOHLCV": False}
-        "ws_enabled": False,  # Set to true for exchanges with tested websocket support
         "has_delisting": False,  # Set to true for exchanges that have delisting pair checks
     }
     _ft_has: FtHas = {}
@@ -192,8 +187,6 @@ class Exchange:
         """
         self._api: ccxt.Exchange
         self._api_async: ccxt_pro.Exchange
-        self._ws_async: ccxt_pro.Exchange = None
-        self._exchange_ws: ExchangeWS | None = None
         self._markets: dict = {}
         self._trading_fees: dict[str, Any] = {}
         self._leverage_tiers: dict[str, list[LeverageTier]] = {}
@@ -279,14 +272,6 @@ class Exchange:
             exchange_conf.get("ccxt_async_config", {}), ccxt_async_config
         )
         self._api_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
-        _has_watch_ohlcv = self.exchange_has("watchOHLCV") and self._ft_has["ws_enabled"]
-        if (
-            self._config["runmode"] in TRADE_MODES
-            and exchange_conf.get("enable_ws", True)
-            and _has_watch_ohlcv
-        ):
-            self._ws_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
-            self._exchange_ws = ExchangeWS(self._config, self._ws_async)
 
         logger.info(f'Using Exchange "{self.name}"')
         self.required_candle_call_count = 1
@@ -311,8 +296,6 @@ class Exchange:
         self.close()
 
     def close(self):
-        if self._exchange_ws:
-            self._exchange_ws.cleanup()
         logger.debug("Exchange object destroyed, closing async loop")
         try:
             generic_loop = asyncio.get_running_loop()
@@ -330,15 +313,6 @@ class Exchange:
         ):
             logger.debug("Closing async ccxt session.")
             self.loop.run_until_complete(self._api_async.close())
-        if (
-            self._ws_async
-            and inspect.iscoroutinefunction(self._ws_async.close)
-            and self._ws_async.session
-            and not loop_running
-        ):
-            logger.debug("Closing ws ccxt session.")
-            self.loop.run_until_complete(self._ws_async.close())
-
         if self.loop and not self.loop.is_closed():
             self.loop.close()
 
@@ -365,7 +339,6 @@ class Exchange:
         self.validate_pricing(config["exit_pricing"])
         self.validate_pricing(config["entry_pricing"])
         self.validate_orderflow(config["exchange"])
-        self.validate_freqai(config)
 
         self._set_startup_candle_count(config)
 
@@ -668,13 +641,6 @@ class Exchange:
             amount, self.get_precision_amount(pair), self.precisionMode, contract_size
         )
 
-    def ws_connection_reset(self):
-        """
-        called at regular intervals to reset the websocket connection
-        """
-        if self._exchange_ws:
-            self._exchange_ws.reset_connections()
-
     async def _api_reload_markets(self, reload: bool = False) -> None:
         try:
             await self._api_async.load_markets(reload=reload, params={})
@@ -723,10 +689,6 @@ class Exchange:
             # Assign options array, as it contains some temporary information from the exchange.
             # ccxt does not implicitly copy options over in set_markets_from_exchange
             self._api.options = self._api_async.options
-            if self._exchange_ws:
-                # Set markets to avoid reloading on websocket api
-                self._ws_async.set_markets_from_exchange(self._api_async)
-                self._ws_async.options = self._api.options
             self._last_markets_refresh = dt_ts()
 
             if is_initial and self._ft_has["needs_trading_fees"]:
@@ -855,19 +817,6 @@ class Exchange:
         ):
             raise ConfigurationError(
                 f"Trade data not available for {self.name}. Can't use orderflow feature."
-            )
-
-    def validate_freqai(self, config: Config) -> None:
-        freqai_enabled = config.get("freqai", {}).get("enabled", False)
-        override = config.get("freqai", {}).get("override_exchange_checks", False)
-        if not override and freqai_enabled and not self._ft_has["ohlcv_has_history"]:
-            raise ConfigurationError(
-                f"Historic OHLCV data not available for {self.name}. Can't use freqAI."
-            )
-        elif override and freqai_enabled and not self._ft_has["ohlcv_has_history"]:
-            logger.warning(
-                "Overriding exchange checks for freqAI. Make sure that your exchange supports "
-                "fetching historic OHLCV data, otherwise freqAI will not work."
             )
 
     def validate_required_startup_candles(self, startup_candles: int, timeframe: str) -> int:
@@ -2552,47 +2501,6 @@ class Exchange:
 
     # Historic data
 
-    def get_historic_ohlcv(
-        self,
-        pair: str,
-        timeframe: str,
-        since_ms: int,
-        candle_type: CandleType,
-        is_new_pair: bool = False,
-        until_ms: int | None = None,
-    ) -> DataFrame:
-        """
-        Get candle history using asyncio and returns the list of candles.
-        Handles all async work for this.
-        Async over one pair, assuming we get `self.ohlcv_candle_limit()` candles per call.
-        :param pair: Pair to download
-        :param timeframe: Timeframe to get data for
-        :param since_ms: Timestamp in milliseconds to get history from
-        :param candle_type: '', mark, index, premiumIndex, or funding_rate
-        :param is_new_pair: used by binance subclass to allow "fast" new pair downloading
-        :param until_ms: Timestamp in milliseconds to get history up to
-        :return: Dataframe with candle (OHLCV) data
-        """
-        with self._loop_lock:
-            pair, _, _, data, _ = self.loop.run_until_complete(
-                self._async_get_historic_ohlcv(
-                    pair=pair,
-                    timeframe=timeframe,
-                    since_ms=since_ms,
-                    until_ms=until_ms,
-                    candle_type=candle_type,
-                    raise_=True,
-                )
-            )
-        logger.debug(f"Downloaded data for {pair} from ccxt with length {len(data)}.")
-        # funding_rates are always complete, so never need to be dropped.
-        drop_incomplete = (
-            self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False
-        )
-        return ohlcv_to_dataframe(
-            data, timeframe, pair, fill_missing=False, drop_incomplete=drop_incomplete
-        )
-
     async def _async_get_historic_ohlcv(
         self,
         pair: str,
@@ -2646,53 +2554,6 @@ class Exchange:
             self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False,
         )
 
-    def _try_build_from_websocket(
-        self, pair: str, timeframe: str, candle_type: CandleType
-    ) -> Coroutine[Any, Any, OHLCVResponse] | None:
-        """
-        Try to build a coroutine to get data from websocket.
-        """
-        if self._can_use_websocket(self._exchange_ws, pair, timeframe, candle_type):
-            candle_ts = dt_ts(timeframe_to_prev_date(timeframe))
-            prev_candle_ts = dt_ts(date_minus_candles(timeframe, 1))
-            candles = self._exchange_ws.ohlcvs(pair, timeframe)
-            half_candle = int(candle_ts - (candle_ts - prev_candle_ts) * 0.5)
-            last_refresh_time = int(
-                self._exchange_ws.klines_last_refresh.get((pair, timeframe, candle_type), 0)
-            )
-
-            if (
-                candles
-                and (
-                    (len(candles) > 1 and candles[-1][0] >= prev_candle_ts)
-                    # Edgecase on reconnect, where 1 candle is available but it's the current one
-                    or (len(candles) == 1 and candles[-1][0] < candle_ts)
-                )
-                and last_refresh_time >= half_candle
-            ):
-                # Usable result, candle contains the previous candle.
-                # Also, we check if the last refresh time is no more than half the candle ago.
-                logger.debug(f"reuse watch result for {pair}, {timeframe}, {last_refresh_time}")
-
-                return self._exchange_ws.get_ohlcv(pair, timeframe, candle_type, candle_ts)
-            logger.info(
-                f"Couldn't reuse watch for {pair}, {timeframe}, falling back to REST api. "
-                f"{candle_ts < last_refresh_time}, {candle_ts}, {last_refresh_time}, "
-                f"{format_ms_time(candle_ts)}, {format_ms_time(last_refresh_time)} "
-            )
-        return None
-
-    def _can_use_websocket(
-        self, exchange_ws: ExchangeWS | None, pair: str, timeframe: str, candle_type: CandleType
-    ) -> TypeGuard[ExchangeWS]:
-        """
-        Check if we can use websocket for this pair.
-        Acts as typeguard for exchangeWs
-        """
-        if exchange_ws and candle_type in (CandleType.SPOT, CandleType.FUTURES):
-            return True
-        return False
-
     def _build_coroutine(
         self,
         pair: str,
@@ -2702,18 +2563,9 @@ class Exchange:
         cache: bool,
     ) -> Coroutine[Any, Any, OHLCVResponse]:
         not_all_data = cache and self.required_candle_call_count > 1
-        if cache:
-            if self._can_use_websocket(self._exchange_ws, pair, timeframe, candle_type):
-                # Subscribe to websocket
-                self._exchange_ws.schedule_ohlcv(pair, timeframe, candle_type)
-
         if cache and (pair, timeframe, candle_type) in self._klines:
             candle_limit = self.ohlcv_candle_limit(timeframe, candle_type)
             min_ts = dt_ts(date_minus_candles(timeframe, candle_limit - 5))
-
-            if ws_resp := self._try_build_from_websocket(pair, timeframe, candle_type):
-                # We have a usable websocket response
-                return ws_resp
 
             # Check if 1 call can get us updated candles without hole in the data.
             if min_ts < self._pairs_last_refresh_time.get((pair, timeframe, candle_type), 0):
@@ -3444,39 +3296,6 @@ class Exchange:
             raise OperationalException(
                 f"Exchange {self.name} does use neither time, nor id based pagination"
             )
-
-    def get_historic_trades(
-        self,
-        pair: str,
-        since: int,
-        until: int | None = None,
-        from_id: str | None = None,
-    ) -> tuple[str, list]:
-        """
-        Get trade history data using asyncio.
-        Handles all async work and returns the list of candles.
-        Async over one pair, assuming we get `self.ohlcv_candle_limit()` candles per call.
-        :param pair: Pair to download
-        :param since: Timestamp in milliseconds to get history from
-        :param until: Timestamp in milliseconds. Defaults to current timestamp if not defined.
-        :param from_id: Download data starting with ID (if id is known)
-        :returns List of trade data
-        """
-        if not self.exchange_has("fetchTrades"):
-            raise OperationalException("This exchange does not support downloading Trades.")
-
-        with self._loop_lock:
-            task = asyncio.ensure_future(
-                self._async_get_trade_history(pair=pair, since=since, until=until, from_id=from_id)
-            )
-
-            for sig in [signal.SIGINT, signal.SIGTERM]:
-                try:
-                    self.loop.add_signal_handler(sig, task.cancel)
-                except (NotImplementedError, RuntimeError):
-                    # Not all platforms implement signals (e.g. windows)
-                    pass
-            return self.loop.run_until_complete(task)
 
     @retrier
     def _get_funding_fees_from_exchange(self, pair: str, since: datetime | int) -> float:

@@ -16,11 +16,6 @@ _SENSITIVE_KEYS = [
     "exchange.walletAddress",
     "exchange.private_key",
     "exchange.privateKey",
-    "telegram.token",
-    "telegram.chat_id",
-    "discord.webhook_url",
-    "api_server.password",
-    "webhook.url",
 ]
 
 

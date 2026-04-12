@@ -13,17 +13,15 @@ import pandas as pd
 import pytest
 from xdist.scheduler.loadscope import LoadScopeScheduling
 
+from argparse import ArgumentParser
+
 from freqtrade import constants
-from freqtrade.commands import Arguments
 from freqtrade.data.converter import ohlcv_to_dataframe, trades_list_to_df
-from freqtrade.enums import CandleType, MarginMode, SignalDirection, TradingMode
+from freqtrade.enums import CandleType, MarginMode, TradingMode
 from freqtrade.exchange import Exchange, timeframe_to_minutes, timeframe_to_seconds
-from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.persistence import LocalTrade, Order, Trade, init_db
 from freqtrade.resolvers import ExchangeResolver
-from freqtrade.system import set_mp_start_method
 from freqtrade.util import dt_now, dt_ts
-from freqtrade.worker import Worker
 from tests.conftest_trades import (
     leverage_trade,
     mock_trade_1,
@@ -121,7 +119,19 @@ def num_log_has_re(line, logs):
 
 
 def get_args(args):
-    return Arguments(args).get_parsed_arg()
+    parser = ArgumentParser(add_help=False)
+    parser.add_argument("command")
+    parser.add_argument("--config", dest="config", action="append")
+    parser.add_argument("--strategy", dest="strategy")
+    parser.add_argument("--export", dest="export")
+    parser.add_argument("--datadir", dest="datadir")
+    parser.add_argument("--timeframe", dest="timeframe")
+    parser.add_argument("--enable-position-stacking", dest="position_stacking", action="store_true")
+    parser.add_argument("--timerange", dest="timerange")
+    parser.add_argument("--export-filename", dest="exportfilename")
+    parser.add_argument("--fee", dest="fee", type=float)
+    parsed = parser.parse_args(args)
+    return vars(parsed)
 
 
 def generate_trades_history(n_rows, start_date: datetime | None = None, days=5):
@@ -244,8 +254,7 @@ def patch_exchange(
     mocker.patch(f"{EXMS}.name", PropertyMock(return_value=exchange.title()))
     mocker.patch(f"{EXMS}.precisionMode", PropertyMock(return_value=2))
     mocker.patch(f"{EXMS}.precision_mode_price", PropertyMock(return_value=2))
-    # Temporary patch ...
-    mocker.patch("freqtrade.exchange.bybit.Bybit.cache_leverage_tiers")
+    mocker.patch(f"{EXMS}.cache_leverage_tiers")
 
     if mock_markets:
         mocker.patch(f"{EXMS}._load_async_markets", return_value={})
@@ -290,92 +299,6 @@ def get_patched_exchange(
 
 def patch_wallet(mocker, free=999.9) -> None:
     mocker.patch("freqtrade.wallets.Wallets.get_free", MagicMock(return_value=free))
-
-
-def patch_whitelist(mocker, conf) -> None:
-    mocker.patch(
-        "freqtrade.freqtradebot.FreqtradeBot._refresh_active_whitelist",
-        MagicMock(return_value=conf["exchange"]["pair_whitelist"]),
-    )
-
-
-# Functions for recurrent object patching
-
-
-def patch_freqtradebot(mocker, config) -> None:
-    """
-    This function patch _init_modules() to not call dependencies
-    :param mocker: a Mocker object to apply patches
-    :param config: Config to pass to the bot
-    :return: None
-    """
-    mocker.patch("freqtrade.freqtradebot.RPCManager", MagicMock())
-    patch_exchange(mocker)
-    mocker.patch("freqtrade.freqtradebot.RPCManager._init", MagicMock())
-    mocker.patch("freqtrade.freqtradebot.RPCManager.send_msg", MagicMock())
-    patch_whitelist(mocker, config)
-    mocker.patch("freqtrade.freqtradebot.ExternalMessageConsumer")
-    mocker.patch("freqtrade.configuration.config_validation._validate_consumers")
-
-
-def get_patched_freqtradebot(mocker, config) -> FreqtradeBot:
-    """
-    This function patches _init_modules() to not call dependencies
-    :param mocker: a Mocker object to apply patches
-    :param config: Config to pass to the bot
-    :return: FreqtradeBot
-    """
-    patch_freqtradebot(mocker, config)
-    return FreqtradeBot(config)
-
-
-def get_patched_worker(mocker, config) -> Worker:
-    """
-    This function patches _init_modules() to not call dependencies
-    :param mocker: a Mocker object to apply patches
-    :param config: Config to pass to the bot
-    :return: Worker
-    """
-    patch_freqtradebot(mocker, config)
-    return Worker(args=None, config=config)
-
-
-def patch_get_signal(
-    freqtrade: FreqtradeBot,
-    enter_long=True,
-    exit_long=False,
-    enter_short=False,
-    exit_short=False,
-    enter_tag: str | None = None,
-    exit_tag: str | None = None,
-) -> None:
-    """
-    :param mocker: mocker to patch IStrategy class
-    :return: None
-    """
-
-    # returns (Signal-direction, signaname)
-    def patched_get_entry_signal(*args, **kwargs):
-        direction = None
-        if enter_long and not any([exit_long, enter_short]):
-            direction = SignalDirection.LONG
-        if enter_short and not any([exit_short, enter_long]):
-            direction = SignalDirection.SHORT
-
-        return direction, enter_tag
-
-    freqtrade.strategy.get_entry_signal = patched_get_entry_signal
-
-    def patched_get_exit_signal(pair, timeframe, dataframe, is_short):
-        if is_short:
-            return enter_short, exit_short, exit_tag
-        else:
-            return enter_long, exit_long, exit_tag
-
-    # returns (enter, exit)
-    freqtrade.strategy.get_exit_signal = patched_get_exit_signal
-
-    freqtrade.exchange.refresh_latest_ohlcv = lambda p: None
 
 
 def create_mock_trades(fee, is_short: bool | None = False, use_db: bool = True):
@@ -496,20 +419,6 @@ def create_mock_trades_usdt(fee, is_short: bool | None = False, use_db: bool = T
         Trade.commit()
 
 
-@pytest.fixture(autouse=True)
-def patch_gc(mocker) -> None:
-    mocker.patch("freqtrade.main.gc_set_threshold")
-
-
-@pytest.fixture(scope="session", autouse=True)
-def fixture_set_mp_start_method():
-    """
-    Patch multiprocessing start mode globally
-    Auto-used, runs once per session.
-    """
-    set_mp_start_method()
-
-
 def is_arm(include_aarch64: bool = False) -> bool:
     machine = platform.machine()
     if include_aarch64:
@@ -556,25 +465,8 @@ def keep_log_config_loggers(mocker):
 
 
 @pytest.fixture(autouse=True)
-def patch_coingecko(mocker) -> None:
-    """
-    Mocker to coingecko to speed up tests
-    :param mocker: mocker to patch coingecko class
-    :return: None
-    """
-
-    tickermock = MagicMock(return_value={"bitcoin": {"usd": 12345.0}, "ethereum": {"usd": 12345.0}})
-    listmock = MagicMock(
-        return_value=[
-            {"id": "bitcoin", "name": "Bitcoin", "symbol": "btc", "website_slug": "bitcoin"},
-            {"id": "ethereum", "name": "Ethereum", "symbol": "eth", "website_slug": "ethereum"},
-        ]
-    )
-    mocker.patch.multiple(
-        "freqtrade.rpc.fiat_convert.FtCoinGeckoApi",
-        get_price=tickermock,
-        get_coins_list=listmock,
-    )
+def patch_coingecko() -> None:
+    return None
 
 
 @pytest.fixture(scope="function")
@@ -620,7 +512,6 @@ def get_default_conf(testdatadir):
         "exchange": {
             "name": "binance",
             "key": "key",
-            "enable_ws": False,
             "secret": "secret",
             "pair_whitelist": ["ETH/BTC", "LTC/BTC", "XRP/BTC", "NEO/BTC"],
             "pair_blacklist": [
@@ -666,7 +557,6 @@ def get_default_conf_usdt(testdatadir):
                 "name": "binance",
                 "enabled": True,
                 "key": "key",
-                "enable_ws": False,
                 "secret": "secret",
                 "pair_whitelist": [
                     "ETH/USDT",

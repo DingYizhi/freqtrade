@@ -44,27 +44,12 @@ BAD_EXCHANGES = {
     "binancecoinm": "Unsupported futures exchange",
 }
 
-MAP_EXCHANGE_CHILDCLASS = {
-    "okex": "okx",
-    "gateio": "gate",
-    "huboi": "htx",
-}
+MAP_EXCHANGE_CHILDCLASS = {}
 
 SUPPORTED_EXCHANGES = [
     "binance",
     "binanceus",
     "binanceusdm",
-    "bingx",
-    "bitmart",
-    "bitget",
-    "bybit",
-    "gate",
-    "htx",
-    "hyperliquid",
-    "kraken",
-    "krakenfutures",
-    "okx",
-    "myokx",
 ]
 
 # either the main, or replacement methods (array) is required
@@ -91,8 +76,6 @@ EXCHANGE_HAS_OPTIONAL: dict[str, list[str]] = {
     "fetchTickers": [],  # For volumepairlist?
     "fetchTrades": [],  # Downloading trades data
     "fetchOrders": ["fetchOpenOrders", "fetchClosedOrders"],  # ,  # Refinding balance...
-    # ccxt.pro
-    "watchOHLCV": [],
 }
 
 EXCHANGE_HAS_OPTIONAL_FUTURES: dict[str, list[str]] = {

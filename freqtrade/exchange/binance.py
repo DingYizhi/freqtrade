@@ -1,24 +1,16 @@
 """Binance exchange subclass"""
 
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import ccxt
-from pandas import DataFrame
 
-from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS
-from freqtrade.enums import TRADE_MODES, CandleType, MarginMode, PriceType, RunMode, TradingMode
+from freqtrade.enums import TRADE_MODES, MarginMode, PriceType, RunMode, TradingMode
 from freqtrade.exceptions import DDosProtection, OperationalException, TemporaryError
 from freqtrade.exchange import Exchange
-from freqtrade.exchange.binance_public_data import (
-    concat_safe,
-    download_archive_ohlcv,
-    download_archive_trades,
-)
 from freqtrade.exchange.common import retrier
 from freqtrade.exchange.exchange_types import FtHas, Tickers
-from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.misc import deep_merge_dicts, json_load
 from freqtrade.util import FtTTLCache
 from freqtrade.util.datetime_helpers import dt_from_ts, dt_ts
@@ -44,7 +36,6 @@ class Binance(Exchange):
         "trades_has_history": True,
         "fetch_orders_limit_minutes": None,
         "l2_limit_range": [5, 10, 20, 50, 100, 500, 1000],
-        "ws_enabled": True,
         "has_delisting": True,
     }
     _ft_has_futures: FtHas = {
@@ -63,14 +54,11 @@ class Binance(Exchange):
             PriceType.LAST: "CONTRACT_PRICE",
             PriceType.MARK: "MARK_PRICE",
         },
-        "ws_enabled": False,
         "proxy_coin_mapping": {
             "BNFCR": "USDC",
             "BFUSD": "USDT",
         },
     }
-    _can_use_data_download_fast = True
-
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
         # (TradingMode.MARGIN, MarginMode.CROSS),
@@ -148,117 +136,6 @@ class Binance(Exchange):
 
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
-
-    def get_historic_ohlcv(
-        self,
-        pair: str,
-        timeframe: str,
-        since_ms: int,
-        candle_type: CandleType,
-        is_new_pair: bool = False,
-        until_ms: int | None = None,
-    ) -> DataFrame:
-        """
-        Overwrite to introduce "fast new pair" functionality by detecting the pair's listing date
-        Does not work for other exchanges, which don't return the earliest data when called with "0"
-        :param candle_type: Any of the enum CandleType (must match trading mode!)
-        """
-        if is_new_pair and candle_type in (CandleType.SPOT, CandleType.FUTURES, CandleType.MARK):
-            with self._loop_lock:
-                x = self.loop.run_until_complete(
-                    self._async_get_candle_history(pair, timeframe, candle_type, 0)
-                )
-            if x and x[3] and x[3][0] and x[3][0][0] > since_ms:
-                # Set starting date to first available candle.
-                since_ms = x[3][0][0]
-                logger.info(
-                    f"Candle-data for {pair} available starting with "
-                    f"{datetime.fromtimestamp(since_ms // 1000, tz=UTC).isoformat()}."
-                )
-                if until_ms and since_ms >= until_ms:
-                    logger.warning(
-                        f"No available candle-data for {pair} before "
-                        f"{dt_from_ts(until_ms).isoformat()}"
-                    )
-                    return DataFrame(columns=DEFAULT_DATAFRAME_COLUMNS)
-
-        if (
-            not self._can_use_data_download_fast
-            or self._config["exchange"].get("only_from_ccxt", False)
-            or
-            # only download timeframes with significant improvements,
-            # otherwise fall back to rest API
-            not (
-                (candle_type == CandleType.SPOT and timeframe in ["1s", "1m", "3m", "5m"])
-                or (
-                    candle_type == CandleType.FUTURES
-                    and timeframe in ["1m", "3m", "5m", "15m", "30m"]
-                )
-            )
-        ):
-            return super().get_historic_ohlcv(
-                pair=pair,
-                timeframe=timeframe,
-                since_ms=since_ms,
-                candle_type=candle_type,
-                is_new_pair=is_new_pair,
-                until_ms=until_ms,
-            )
-        else:
-            # Download from data.binance.vision
-            return self.get_historic_ohlcv_fast(
-                pair=pair,
-                timeframe=timeframe,
-                since_ms=since_ms,
-                candle_type=candle_type,
-                is_new_pair=is_new_pair,
-                until_ms=until_ms,
-            )
-
-    def get_historic_ohlcv_fast(
-        self,
-        pair: str,
-        timeframe: str,
-        since_ms: int,
-        candle_type: CandleType,
-        is_new_pair: bool = False,
-        until_ms: int | None = None,
-    ) -> DataFrame:
-        """
-        Fastly fetch OHLCV data by leveraging https://data.binance.vision.
-        """
-        with self._loop_lock:
-            df = self.loop.run_until_complete(
-                download_archive_ohlcv(
-                    candle_type=candle_type,
-                    pair=pair,
-                    timeframe=timeframe,
-                    since_ms=since_ms,
-                    until_ms=until_ms,
-                    markets=self.markets,
-                )
-            )
-
-        # download the remaining data from rest API
-        if df.empty:
-            rest_since_ms = since_ms
-        else:
-            rest_since_ms = dt_ts(df.iloc[-1].date) + timeframe_to_msecs(timeframe)
-
-        # make sure since <= until
-        if until_ms and rest_since_ms > until_ms:
-            rest_df = DataFrame()
-        else:
-            rest_df = super().get_historic_ohlcv(
-                pair=pair,
-                timeframe=timeframe,
-                since_ms=rest_since_ms,
-                candle_type=candle_type,
-                is_new_pair=is_new_pair,
-                until_ms=until_ms,
-            )
-        all_df = concat_safe([df, rest_df])
-        return all_df
 
     def funding_fee_cutoff(self, open_date: datetime):
         """
@@ -407,46 +284,6 @@ class Binance(Exchange):
         self, pair: str, until: int, since: int, from_id: str | None = None
     ) -> tuple[str, list[list]]:
         logger.info(f"Fetching trades for {pair} from Binance, {from_id=}, {since=}, {until=}")
-
-        if (
-            not self._config["exchange"].get("only_from_ccxt", False)
-            and self._can_use_data_download_fast
-        ):
-            if from_id is None or not since:
-                trades = await self._api_async.fetch_trades(
-                    pair,
-                    params={
-                        self._ft_has["trades_pagination_arg"]: "0",
-                    },
-                    limit=5,
-                )
-                listing_date: int = trades[0]["timestamp"]
-                since = max(since, listing_date)
-
-            _, res = await download_archive_trades(
-                CandleType.FUTURES if self.trading_mode == "futures" else CandleType.SPOT,
-                pair,
-                since_ms=since,
-                until_ms=until,
-                markets=self.markets,
-            )
-
-            if not res:
-                end_time = since
-                end_id = from_id
-            else:
-                end_time = res[-1][0]
-                end_id = res[-1][1]
-
-            if end_time and end_time >= until:
-                return pair, res
-            else:
-                _, res2 = await super()._async_get_trade_history_id(
-                    pair, until=until, since=end_time, from_id=end_id
-                )
-                res.extend(res2)
-                return pair, res
-
         return await super()._async_get_trade_history_id(
             pair, until=until, since=since, from_id=from_id
         )
@@ -575,5 +412,3 @@ class Binanceus(Binance):
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
     ]
-    # binance vision does not have data for binanceus
-    _can_use_data_download_fast = False

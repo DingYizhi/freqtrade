@@ -40,9 +40,6 @@ updates:
     pytest:
       patterns:
         - "pytest*"
-    mkdocs:
-      patterns:
-        - "mkdocs*"
     scipy:
       patterns:
         - "scipy"

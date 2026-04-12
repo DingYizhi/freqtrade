@@ -12,7 +12,6 @@ from freqtrade.enums import CandleType, PriceType
 DOCS_LINK = "https://www.freqtrade.io/en/stable"
 DEFAULT_CONFIG = "config.json"
 PROCESS_THROTTLE_SECS = 5  # sec
-HYPEROPT_EPOCH = 100  # epochs
 RETRY_TIMEOUT = 30  # sec
 TIMEOUT_UNITS = ["minutes", "seconds"]
 EXPORT_OPTIONS = ["none", "trades", "signals"]
@@ -27,54 +26,11 @@ ORDERTYPE_POSSIBILITIES = ["limit", "market"]
 _ORDERTIF_POSSIBILITIES = ["GTC", "FOK", "IOC", "PO"]
 ORDERTIF_POSSIBILITIES = _ORDERTIF_POSSIBILITIES + [t.lower() for t in _ORDERTIF_POSSIBILITIES]
 STOPLOSS_PRICE_TYPES = [p for p in PriceType]
-HYPEROPT_LOSS_BUILTIN = [
-    "ShortTradeDurHyperOptLoss",
-    "OnlyProfitHyperOptLoss",
-    "SharpeHyperOptLoss",
-    "SharpeHyperOptLossDaily",
-    "SortinoHyperOptLoss",
-    "SortinoHyperOptLossDaily",
-    "CalmarHyperOptLoss",
-    "MaxDrawDownHyperOptLoss",
-    "MaxDrawDownRelativeHyperOptLoss",
-    "MaxDrawDownPerPairHyperOptLoss",
-    "ProfitDrawDownHyperOptLoss",
-    "MultiMetricHyperOptLoss",
-]
-HYPEROPT_BUILTIN_SPACES = [
-    "buy",
-    "sell",
-    "enter",
-    "exit",
-    "roi",
-    "stoploss",
-    "trailing",
-    "protection",
-    "trades",
-]
-HYPEROPT_BUILTIN_SPACE_OPTIONS = ["default", "all"] + HYPEROPT_BUILTIN_SPACES
 
 AVAILABLE_PAIRLISTS = [
     "StaticPairList",
-    "VolumePairList",
-    "PercentChangePairList",
-    "ProducerPairList",
-    "RemotePairList",
-    "MarketCapPairList",
-    "CrossMarketPairList",
-    "AgeFilter",
-    "DelistFilter",
-    "FullTradesFilter",
-    "OffsetFilter",
-    "PerformanceFilter",
-    "PrecisionFilter",
-    "PriceFilter",
-    "RangeStabilityFilter",
-    "ShuffleFilter",
-    "SpreadFilter",
-    "VolatilityFilter",
 ]
-AVAILABLE_DATAHANDLERS = ["json", "jsongz", "feather", "parquet"]
+AVAILABLE_DATAHANDLERS = ["feather"]
 BACKTEST_BREAKDOWNS = ["day", "week", "month", "year", "weekday"]
 BACKTEST_CACHE_AGE = ["none", "day", "week", "month"]
 BACKTEST_CACHE_DEFAULT = "day"
@@ -114,13 +70,7 @@ MARGIN_MODES = ["cross", "isolated", ""]
 LAST_BT_RESULT_FN = ".last_result.json"
 FTHYPT_FILEVERSION = "fthypt_fileversion"
 
-USERPATH_HYPEROPTS = "hyperopts"
 USERPATH_STRATEGIES = "strategies"
-USERPATH_NOTEBOOKS = "notebooks"
-USERPATH_FREQAIMODELS = "freqaimodels"
-
-TELEGRAM_SETTING_OPTIONS = ["on", "off", "silent"]
-WEBHOOK_FORMAT_OPTIONS = ["form", "json", "raw"]
 FULL_DATAFRAME_THRESHOLD = 100
 CUSTOM_TAG_MAX_LENGTH = 255
 DL_DATA_TIMEFRAMES = ["1m", "5m"]
@@ -139,13 +89,6 @@ DECIMALS_PER_COIN = {
 }
 
 DUST_PER_COIN = {"BTC": 0.0001, "ETH": 0.01}
-
-# Source files with destination directories within user-directory
-USER_DATA_FILES = {
-    "sample_strategy.py": USERPATH_STRATEGIES,
-    "sample_hyperopt_loss.py": USERPATH_HYPEROPTS,
-    "strategy_analysis_example.ipynb": USERPATH_NOTEBOOKS,
-}
 
 SUPPORTED_FIAT = [
     "AUD",

@@ -15,7 +15,7 @@ def setup_utils_configuration(
 ) -> dict[str, Any]:
     """
     Prepare the configuration for utils subcommands
-    :param args: Cli args from Arguments()
+    :param args: Parsed configuration arguments
     :param method: Bot running mode
     :return: Configuration
     """

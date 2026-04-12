@@ -9,10 +9,6 @@ from collections.abc import Sequence
 from contextlib import suppress
 from typing import Any, Union
 
-from freqtrade.enums import HyperoptState
-from freqtrade.optimize.hyperopt_tools import HyperoptStateContainer
-
-
 with suppress(ImportError):
     from freqtrade.optimize.space import (
         Categorical,
@@ -81,11 +77,7 @@ class BaseParameter(ABC):
         """
 
     def can_optimize(self):
-        return (
-            self.in_space
-            and self.optimize
-            and HyperoptStateContainer.state != HyperoptState.OPTIMIZE
-        )
+        return self.in_space and self.optimize
 
 
 class NumericParameter(BaseParameter):

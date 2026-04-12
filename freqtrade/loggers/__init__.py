@@ -99,9 +99,8 @@ def _set_log_levels(
         "asyncio": logging.INFO if verbosity <= 1 else logging.DEBUG,
         "httpcore": logging.INFO if verbosity <= 1 else logging.DEBUG,
         "ccxt.base.exchange": logging.INFO if verbosity <= 2 else logging.DEBUG,
-        "telegram": logging.INFO,
         "httpx": logging.WARNING,
-        "werkzeug": logging.ERROR if api_verbosity == "error" else logging.INFO,
+        "werkzeug": logging.ERROR,
     }
 
     # Add third party loggers to the configuration
@@ -210,9 +209,7 @@ def setup_logging(config: Config) -> None:
     verbosity = config["verbosity"]
     if os.environ.get("PYTEST_VERSION") is None or config.get("ft_tests_force_logging"):
         log_config = _create_log_config(config)
-        _set_log_levels(
-            log_config, verbosity, config.get("api_server", {}).get("verbosity", "info")
-        )
+        _set_log_levels(log_config, verbosity, "error")
 
         logging.config.dictConfig(log_config)
 

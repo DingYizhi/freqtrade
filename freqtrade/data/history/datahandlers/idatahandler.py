@@ -415,7 +415,7 @@ class IDataHandler(ABC):
             if warn_no_data:
                 logger.warning(
                     f"No history for {pair}, {candle_type}, {timeframe} found. "
-                    "Use `freqtrade download-data` to download the data"
+                    "Provide local history data in the configured datadir before backtesting."
                 )
             return True
         elif warn_price:
@@ -528,15 +528,7 @@ def get_datahandlerclass(datatype: str) -> type[IDataHandler]:
     :return: Datahandler class
     """
 
-    if datatype == "json":
-        from .jsondatahandler import JsonDataHandler
-
-        return JsonDataHandler
-    elif datatype == "jsongz":
-        from .jsondatahandler import JsonGzDataHandler
-
-        return JsonGzDataHandler
-    elif datatype == "hdf5":
+    if datatype == "hdf5":
         raise OperationalException(
             "DEPRECATED: The hdf5 dataformat is deprecated and has been removed in 2025.1. "
             "Please downgrade to 2024.12 and use the convert-data command to convert your data "
@@ -544,16 +536,15 @@ def get_datahandlerclass(datatype: str) -> type[IDataHandler]:
             "We recommend using the feather format, as it is faster and is more space-efficient."
         )
 
-    elif datatype == "feather":
+    if datatype == "feather":
         from .featherdatahandler import FeatherDataHandler
 
         return FeatherDataHandler
-    elif datatype == "parquet":
-        from .parquetdatahandler import ParquetDataHandler
 
-        return ParquetDataHandler
-    else:
-        raise ValueError(f"No datahandler for datatype {datatype} available.")
+    raise OperationalException(
+        f"Data format '{datatype}' is not supported by this backtesting-only fork. "
+        "Use the feather format."
+    )
 
 
 def get_datahandler(

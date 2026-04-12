@@ -8,8 +8,6 @@ from .bt_fileutils import (
     get_backtest_result,
     get_backtest_resultlist,
     get_latest_backtest_filename,
-    get_latest_hyperopt_file,
-    get_latest_hyperopt_filename,
     get_latest_optimize_filename,
     load_and_merge_backtest_result,
     load_backtest_analysis_data,
@@ -23,7 +21,3 @@ from .bt_fileutils import (
     update_backtest_metadata,
 )
 from .historic_precision import get_tick_size_over_time
-from .trade_parallelism import (
-    analyze_trade_parallelism,
-    evaluate_result_multi,
-)

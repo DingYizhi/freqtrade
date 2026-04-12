@@ -3,9 +3,8 @@
 from datetime import datetime
 
 import talib.abstract as ta
-from pandas import DataFrame
+from pandas import DataFrame, Series
 
-import freqtrade.vendor.qtpylib.indicators as qtpylib
 from freqtrade.persistence import Trade
 from freqtrade.strategy import (
     BooleanParameter,
@@ -14,6 +13,26 @@ from freqtrade.strategy import (
     IStrategy,
     RealParameter,
 )
+
+
+def typical_price(dataframe: DataFrame) -> Series:
+    return (dataframe["high"] + dataframe["low"] + dataframe["close"]) / 3.0
+
+
+def bollinger_bands(series: Series, window: int = 20, stds: int = 2) -> DataFrame:
+    mid = series.rolling(window=window, min_periods=1).mean()
+    std = series.rolling(window=window, min_periods=1).std().fillna(0.0)
+    return DataFrame({"upper": mid + std * stds, "mid": mid, "lower": mid - std * stds})
+
+
+def crossed_above(series1: Series, series2: Series | float | int) -> Series:
+    other = series2 if isinstance(series2, Series) else Series(series2, index=series1.index)
+    return (series1 > other) & (series1.shift(1) <= other.shift(1))
+
+
+def crossed_below(series1: Series, series2: Series | float | int) -> Series:
+    other = series2 if isinstance(series2, Series) else Series(series2, index=series1.index)
+    return (series1 < other) & (series1.shift(1) >= other.shift(1))
 
 
 class StrategyTestV3(IStrategy):
@@ -128,7 +147,7 @@ class StrategyTestV3(IStrategy):
         dataframe["fastk"] = stoch_fast["fastk"]
 
         # Bollinger bands
-        bollinger = qtpylib.bollinger_bands(qtpylib.typical_price(dataframe), window=20, stds=2)
+        bollinger = bollinger_bands(typical_price(dataframe), window=20, stds=2)
         dataframe["bb_lowerband"] = bollinger["lower"]
         dataframe["bb_middleband"] = bollinger["mid"]
         dataframe["bb_upperband"] = bollinger["upper"]
@@ -150,7 +169,7 @@ class StrategyTestV3(IStrategy):
             "enter_long",
         ] = 1
         dataframe.loc[
-            (qtpylib.crossed_below(dataframe["rsi"], self.sell_rsi.value)),
+            (crossed_below(dataframe["rsi"], self.sell_rsi.value)),
             ("enter_short", "enter_tag"),
         ] = (1, "short_Tag")
 
@@ -160,8 +179,8 @@ class StrategyTestV3(IStrategy):
         dataframe.loc[
             (
                 (
-                    (qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value))
-                    | (qtpylib.crossed_above(dataframe["fastd"], 70))
+                    (crossed_above(dataframe["rsi"], self.sell_rsi.value))
+                    | (crossed_above(dataframe["fastd"], 70))
                 )
                 & (dataframe["adx"] > 10)
                 & (dataframe["minus_di"] > 0)
@@ -171,7 +190,7 @@ class StrategyTestV3(IStrategy):
         ] = 1
 
         dataframe.loc[
-            (qtpylib.crossed_above(dataframe["rsi"], self.buy_rsi.value)),
+            (crossed_above(dataframe["rsi"], self.buy_rsi.value)),
             ("exit_short", "exit_tag"),
         ] = (1, "short_Tag")
 

@@ -62,10 +62,6 @@ function updateenv() {
     SYS_ARCH=$(uname -m)
     echo "pip install in-progress. Please wait..."
     ${PIP} install --upgrade pip wheel setuptools
-    REQUIREMENTS_HYPEROPT=""
-    REQUIREMENTS_PLOT=""
-    REQUIREMENTS_FREQAI=""
-    REQUIREMENTS_FREQAI_RL=""
     REQUIREMENTS=requirements.txt
 
     read -p "Do you want to install dependencies for development (Performs a full install with all dependencies) [y/N]? "
@@ -73,38 +69,9 @@ function updateenv() {
     if [[ $REPLY =~ ^[Yy]$ ]]
     then
         REQUIREMENTS=requirements-dev.txt
-    else
-        # requirements-dev.txt includes all the below requirements already, so further questions are pointless.
-        read -p "Do you want to install plotting dependencies (plotly) [y/N]? "
-        if [[ $REPLY =~ ^[Yy]$ ]]
-        then
-            REQUIREMENTS_PLOT="-r requirements-plot.txt"
-        fi
-        if [ "${SYS_ARCH}" == "armv7l" ] || [ "${SYS_ARCH}" == "armv6l" ]; then
-            echo "Detected Raspberry, installing cython, skipping hyperopt installation."
-            ${PIP} install --upgrade cython
-        else
-            # Is not Raspberry
-            read -p "Do you want to install hyperopt dependencies [y/N]? "
-            if [[ $REPLY =~ ^[Yy]$ ]]
-            then
-                REQUIREMENTS_HYPEROPT="-r requirements-hyperopt.txt"
-            fi
-        fi
-
-        read -p "Do you want to install dependencies for freqai [y/N]? "
-        if [[ $REPLY =~ ^[Yy]$ ]]
-        then
-            REQUIREMENTS_FREQAI="-r requirements-freqai.txt"
-            read -p "Do you also want dependencies for freqai-rl or PyTorch (~700mb additional space required) [y/N]? "
-            if [[ $REPLY =~ ^[Yy]$ ]]
-            then
-                REQUIREMENTS_FREQAI="-r requirements-freqai-rl.txt"
-            fi
-        fi
     fi
 
-    ${PIP} install --upgrade -r ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT} ${REQUIREMENTS_FREQAI} ${REQUIREMENTS_FREQAI_RL}
+    ${PIP} install --upgrade -r ${REQUIREMENTS}
     if [ $? -ne 0 ]; then
         echo "Failed installing dependencies"
         exit 1
@@ -114,10 +81,6 @@ function updateenv() {
         echo "Failed installing Freqtrade"
         exit 1
     fi
-
-    echo "Installing freqUI"
-    freqtrade install-ui
-
     echo "pip install completed"
     echo
     if [[ $dev =~ ^[Yy]$ ]]; then
