@@ -648,6 +648,15 @@ class LocalTrade:
                 f"{self.trading_mode} trading requires param interest_rate on trades"
             )
 
+    def __copy__(self):
+        """Lightweight copy for strategy callbacks (read-only protection).
+        Shallow-copies all scalar attrs; only the orders list gets a new list wrapper.
+        Order objects themselves are NOT copied (callbacks must not mutate them)."""
+        clone = object.__new__(self.__class__)
+        clone.__dict__.update(self.__dict__)
+        clone.orders = self.orders[:]
+        return clone
+
     def __repr__(self):
         open_since = (
             self.open_date_utc.strftime(DATETIME_PRINT_FORMAT) if self.is_open else "closed"

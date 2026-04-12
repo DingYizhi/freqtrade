@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from copy import deepcopy
+from copy import copy
 from functools import wraps
 from typing import Any, TypeVar, cast
 
@@ -42,7 +42,7 @@ def strategy_safe_wrapper(f: F, message: str = "", default_retval=None, supress_
                 # Don't deep-copy if the function is not implemented in the user strategy.``
                 if "trade" in kwargs:
                     # Protect accidental modifications from within the strategy
-                    kwargs["trade"] = deepcopy(kwargs["trade"])
+                    kwargs["trade"] = copy(kwargs["trade"])
             return f(*args, **kwargs)
         except ValueError as error:
             traceback = __format_traceback(error)

@@ -287,7 +287,9 @@ def mock_exchange_context(
             side_effect=lambda exchange_conf, sync, ccxt_kwargs: next(ccxt_inits),
         )
     )
-    stack.enter_context(patch(f"{EXMS}._load_async_markets", return_value=None))
+    stack.enter_context(
+        patch.object(sync_api, "load_markets", return_value=sync_api.markets)
+    )
 
     if is_futures_mode(config):
         stack.enter_context(
