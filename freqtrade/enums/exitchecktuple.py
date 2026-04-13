@@ -9,9 +9,21 @@ class ExitCheckTuple:
     exit_type: ExitType
     exit_reason: str = ""
 
+    # Pre-allocated singleton for the common NONE case
+    _NONE: "ExitCheckTuple | None" = None
+
     def __init__(self, exit_type: ExitType, exit_reason: str = ""):
         self.exit_type = exit_type
         self.exit_reason = exit_reason or exit_type.value
+
+    @staticmethod
+    def none() -> "ExitCheckTuple":
+        """Return a cached NONE instance to avoid allocation in the hot loop."""
+        inst = ExitCheckTuple._NONE
+        if inst is None:
+            inst = ExitCheckTuple(exit_type=ExitType.NONE)
+            ExitCheckTuple._NONE = inst
+        return inst
 
     @property
     def exit_flag(self):

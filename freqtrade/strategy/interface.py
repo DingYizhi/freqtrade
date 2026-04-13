@@ -221,6 +221,16 @@ class IStrategy(ABC, HyperStrategyMixin):
         # Pre-sort ROI keys for bisect lookup
         self._minimal_roi_keys = sorted(self.minimal_roi.keys())
 
+    def _init_bt_direct(self) -> None:
+        """
+        Replace safe wrappers with direct method references for backtest.
+        Skips try/except overhead on every call in the hot loop.
+        """
+        self._w_custom_exit = self.custom_exit
+        self._w_custom_stoploss = self.custom_stoploss
+        self._w_custom_roi = self.custom_roi
+        self._w_adjust_trade_position = self.adjust_trade_position
+
     @abstractmethod
     def populate_indicators(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
@@ -1374,6 +1384,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         else:
             return False
 
+    _EMPTY_EXITS: list[ExitCheckTuple] = []
+
     def should_exit(
         self,
         trade: Trade,
@@ -1395,7 +1407,6 @@ class IStrategy(ABC, HyperStrategyMixin):
         :param force_stoploss: Externally provided stoploss
         :return: List of exit reasons - or empty list.
         """
-        exits: list[ExitCheckTuple] = []
         current_rate = rate
 
         current_profit = _current_profit if _current_profit is not None else trade.calc_profit_ratio(current_rate)
@@ -1450,24 +1461,39 @@ class IStrategy(ABC, HyperStrategyMixin):
                             custom_reason = reason_cust[:CUSTOM_TAG_MAX_LENGTH]
                     else:
                         custom_reason = ""
-            if exit_signal == ExitType.CUSTOM_EXIT or (
-                exit_signal == ExitType.EXIT_SIGNAL
-                and (not self.exit_profit_only or current_profit > self.exit_profit_offset)
-            ):
-                logger.debug(
-                    f"{trade.pair} - Sell signal received. "
-                    f"exit_type=ExitType.{exit_signal.name}"
-                    + (f", custom_reason={custom_reason}" if custom_reason else "")
-                )
-                exits.append(ExitCheckTuple(exit_type=exit_signal, exit_reason=custom_reason))
+
+        # Fast path: nothing triggered — skip list allocation (most common case)
+        sl_type = stoplossflag.exit_type
+        has_exit_signal = False
+        if exit_signal == ExitType.CUSTOM_EXIT or (
+            exit_signal == ExitType.EXIT_SIGNAL
+            and (not self.exit_profit_only or current_profit > self.exit_profit_offset)
+        ):
+            has_exit_signal = True
+
+        if (
+            not has_exit_signal
+            and sl_type == ExitType.NONE
+            and not roi_reached
+        ):
+            return self._EMPTY_EXITS
 
         # Sequence:
         # Exit-signal
         # Stoploss
         # ROI
         # Trailing stoploss
+        exits: list[ExitCheckTuple] = []
 
-        if stoplossflag.exit_type in (ExitType.STOP_LOSS, ExitType.LIQUIDATION):
+        if has_exit_signal:
+            logger.debug(
+                f"{trade.pair} - Sell signal received. "
+                f"exit_type=ExitType.{exit_signal.name}"
+                + (f", custom_reason={custom_reason}" if custom_reason else "")
+            )
+            exits.append(ExitCheckTuple(exit_type=exit_signal, exit_reason=custom_reason))
+
+        if sl_type in (ExitType.STOP_LOSS, ExitType.LIQUIDATION):
             logger.debug(f"{trade.pair} - Stoploss hit. exit_type={stoplossflag.exit_type}")
             exits.append(stoplossflag)
 
@@ -1475,7 +1501,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             logger.debug(f"{trade.pair} - Required profit reached. exit_type=ExitType.ROI")
             exits.append(ExitCheckTuple(exit_type=ExitType.ROI))
 
-        if stoplossflag.exit_type == ExitType.TRAILING_STOP_LOSS:
+        if sl_type == ExitType.TRAILING_STOP_LOSS:
             logger.debug(f"{trade.pair} - Trailing stoploss hit.")
             exits.append(stoplossflag)
 
@@ -1616,7 +1642,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             logger.debug(f"{trade.pair} - Liquidation price hit. exit_type=ExitType.LIQUIDATION")
             return ExitCheckTuple(exit_type=ExitType.LIQUIDATION)
 
-        return ExitCheckTuple(exit_type=ExitType.NONE)
+        return ExitCheckTuple.none()
 
     def min_roi_reached_entry(
         self,

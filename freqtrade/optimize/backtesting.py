@@ -942,10 +942,11 @@ class Backtesting:
                 high=row[HIGH_IDX],
                 _current_profit=current_profit_open,
             )
-            for exit_ in exits:
-                t = self._get_exit_for_signal(trade, row, exit_, current_time)
-                if t:
-                    return t
+            if exits:
+                for exit_ in exits:
+                    t = self._get_exit_for_signal(trade, row, exit_, current_time)
+                    if t:
+                        return t
         return None
 
     def _run_funding_fees(self, trade: LocalTrade, current_time: datetime, force: bool = False):
@@ -1607,6 +1608,7 @@ class Backtesting:
 
         current_time = start_date + timeframe_td
         strategy = self.strategy
+        single_pair = len(pairs) == 1
         while current_time <= end_date:
             check_abort()
             # Precompute timestamp once per time-step (reused by _run_funding_fees, min_roi_reached)
@@ -1616,16 +1618,16 @@ class Backtesting:
             if has_bot_loop:
                 self._w_bot_loop_start(current_time=current_time)
 
-            pairs_with_open_trades = [t.pair for t in bt_trades_open]
+            open_trade_pairs = {t.pair for t in bt_trades_open}
 
             # No detail: is_first=True, has_detail=False always
             # Build pairlist: open trade pairs first
-            if bt_trades_open:
+            if single_pair or not bt_trades_open:
+                pairlist = pairs
+            else:
                 pairlist = list(dict.fromkeys(
                     [t.pair for t in bt_trades_open] + pairs
                 ))
-            else:
-                pairlist = pairs
 
             for pair in pairlist:
                 row_index = indexes[pair]
@@ -1641,10 +1643,8 @@ class Backtesting:
                 dp_set_max_date(current_time)
 
                 pair_has_open_trades = len(bt_trades_open_pp[pair]) > 0
-                if pair in pairs_with_open_trades and not pair_has_open_trades:
+                if pair in open_trade_pairs and not pair_has_open_trades:
                     continue
-                if pair_has_open_trades and pair not in pairs_with_open_trades:
-                    pairs_with_open_trades.append(pair)
 
                 is_last_row = current_time == end_date
                 yield current_time, pair, row, is_last_row, trade_dir
@@ -1781,6 +1781,7 @@ class Backtesting:
             self.strategy.bot_loop_start, supress_error=True
         )
         self.strategy._init_bt_wrappers()
+        self.strategy._init_bt_direct()
         # Use dict of lists with data for performance
         # (looping lists is a lot faster than pandas DataFrames)
         data: dict = self._get_ohlcv_as_lists(processed)

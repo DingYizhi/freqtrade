@@ -633,6 +633,9 @@ class LocalTrade:
     open_rate_requested: float | None = None
     # open_trade_value - calculated via _calc_open_trade_value
     open_trade_value: float = 0.0
+    # Precomputed profit calculation cache (updated by _update_bt_profit_cache)
+    _bt_profit_factor: float = 0.0
+    _bt_profit_offset: float = 0.0
     close_rate: float | None = None
     close_rate_requested: float | None = None
     close_profit: float | None = None
@@ -1040,6 +1043,7 @@ class LocalTrade:
         self.funding_fee_running = funding_fee
         prior_funding_fees = sum([o.funding_fee for o in self.orders if o.funding_fee])
         self.funding_fees = prior_funding_fees + funding_fee
+        self._update_bt_profit_cache()
 
     def __set_stop_loss(self, stop_loss: float, percent: float):
         """
@@ -1285,6 +1289,47 @@ class LocalTrade:
         Must be called whenever open_rate, fee_open is changed.
         """
         self.open_trade_value = self._calc_open_trade_value(self.amount, self.open_rate)
+        self._update_bt_profit_cache()
+
+    def _update_bt_profit_cache(self) -> None:
+        """
+        Precompute constants for fast calc_profit_ratio.
+        profit_ratio = (rate * _bt_profit_factor + _bt_profit_offset) * leverage
+        Only valid for the default (amount=None, open_rate=None) call path.
+        """
+        otv = self.open_trade_value
+        if otv == 0.0:
+            self._bt_profit_factor = 0.0
+            self._bt_profit_offset = 0.0
+            return
+
+        amt = self.amount
+        fee = self.fee_close or 0.0
+        funding = self.funding_fees or 0.0
+        tm = self.trading_mode or TradingMode.SPOT
+
+        if tm == TradingMode.FUTURES:
+            if self.is_short:
+                # close_val = amt * rate * (1+fee) - funding
+                # profit = (1 - close_val/otv) = 1 - amt*(1+fee)/otv * rate + funding/otv
+                self._bt_profit_factor = -amt * (1.0 + fee) / otv
+                self._bt_profit_offset = 1.0 + funding / otv
+            else:
+                # close_val = amt * rate * (1-fee) + funding
+                # profit = close_val/otv - 1 = amt*(1-fee)/otv * rate + funding/otv - 1
+                self._bt_profit_factor = amt * (1.0 - fee) / otv
+                self._bt_profit_offset = funding / otv - 1.0
+        elif tm == TradingMode.SPOT:
+            if self.is_short:
+                self._bt_profit_factor = -amt * (1.0 + fee) / otv
+                self._bt_profit_offset = 1.0
+            else:
+                self._bt_profit_factor = amt * (1.0 - fee) / otv
+                self._bt_profit_offset = -1.0
+        else:
+            # Margin mode: don't use fast path
+            self._bt_profit_factor = 0.0
+            self._bt_profit_offset = 0.0
 
     def calculate_interest(self) -> FtPrecise:
         """
@@ -1434,6 +1479,12 @@ class LocalTrade:
         :param open_rate: open_rate to use. Defaults to self.open_rate if not provided.
         :return: profit ratio as float
         """
+        # Fast path: default amount/open_rate with precomputed factor
+        if amount is None and open_rate is None:
+            pf = self._bt_profit_factor
+            if pf != 0.0:
+                return round((rate * pf + self._bt_profit_offset) * self.leverage, 8)
+
         close_trade_value = self.calc_close_trade_value(rate, amount)
 
         if amount is None and open_rate is None:
