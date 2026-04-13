@@ -10,6 +10,7 @@ from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
+import polars as pl
 from pandas import DataFrame
 
 from freqtrade.configuration import TimeRange
@@ -41,7 +42,7 @@ class DataProvider:
         self._exchange = exchange
         self._pairlists = pairlists
         self.__rpc = rpc
-        self.__cached_pairs: dict[PairWithTimeframe, tuple[DataFrame, datetime]] = {}
+        self.__cached_pairs: dict[PairWithTimeframe, tuple[pl.DataFrame, datetime]] = {}
         self.__slice_index: dict[str, int] = {}
         self.__slice_date: datetime | None = None
 
@@ -72,7 +73,7 @@ class DataProvider:
         self.__slice_date = limit_date
 
     def _set_cached_df(
-        self, pair: str, timeframe: str, dataframe: DataFrame, candle_type: CandleType
+        self, pair: str, timeframe: str, dataframe: pl.DataFrame, candle_type: CandleType
     ) -> None:
         """
         Store cached Dataframe.
@@ -80,7 +81,7 @@ class DataProvider:
         (but the class is exposed via `self.dp` to the strategy)
         :param pair: pair to get the data for
         :param timeframe: Timeframe to get data for
-        :param dataframe: analyzed dataframe
+        :param dataframe: analyzed dataframe (polars)
         :param candle_type: Any of the enum CandleType (must match trading mode!)
         """
         pair_key = (pair, timeframe, candle_type)
@@ -183,14 +184,14 @@ class DataProvider:
             logger.warning(f"No data found for ({pair}, {timeframe}, {candle_type}).")
         return data
 
-    def get_analyzed_dataframe(self, pair: str, timeframe: str) -> tuple[DataFrame, datetime]:
+    def get_analyzed_dataframe(self, pair: str, timeframe: str) -> tuple[pl.DataFrame, datetime]:
         """
         Retrieve the analyzed dataframe. Returns the full dataframe in trade mode (live / dry),
         and the last 1000 candles (up to the time evaluated at this moment) in all other modes.
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
-        :return: Tuple of (Analyzed Dataframe, lastrefreshed) for the requested pair / timeframe
-            combination.
+        :return: Tuple of (Analyzed Dataframe (polars), lastrefreshed) for the requested pair /
+            timeframe combination.
             Returns empty dataframe and Epoch 0 (1970-01-01) if no dataframe was cached.
         """
         pair_key = (pair, timeframe, self._config.get("candle_type_def", CandleType.SPOT))
@@ -200,12 +201,13 @@ class DataProvider:
             else:
                 df, date = self.__cached_pairs[pair_key]
                 if (max_index := self.__slice_index.get(pair)) is not None:
-                    df = df.iloc[max(0, max_index - MAX_DATAFRAME_CANDLES) : max_index]
+                    start = max(0, max_index - MAX_DATAFRAME_CANDLES)
+                    df = df.slice(start, max_index - start)
                 else:
-                    return (DataFrame(), datetime.fromtimestamp(0, tz=UTC))
+                    return (pl.DataFrame(), datetime.fromtimestamp(0, tz=UTC))
             return df, date
         else:
-            return (DataFrame(), datetime.fromtimestamp(0, tz=UTC))
+            return (pl.DataFrame(), datetime.fromtimestamp(0, tz=UTC))
 
     @property
     def runmode(self) -> RunMode:

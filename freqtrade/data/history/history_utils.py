@@ -114,17 +114,24 @@ def load_data(
     return result
 
 
-def get_timerange(data: dict[str, DataFrame]) -> tuple[datetime, datetime]:
+def get_timerange(data: dict) -> tuple[datetime, datetime]:
     """
     Get the maximum common timerange for the given backtest data.
 
-    :param data: dictionary with preprocessed backtesting data
+    :param data: dictionary with preprocessed backtesting data (polars or pandas DataFrames)
     :return: tuple containing min_date, max_date
     """
-    timeranges = [
-        (frame["date"].min().to_pydatetime(), frame["date"].max().to_pydatetime())
-        for frame in data.values()
-    ]
+    import polars as pl
+
+    timeranges = []
+    for frame in data.values():
+        if isinstance(frame, pl.DataFrame):
+            min_dt = frame["date"].min()
+            max_dt = frame["date"].max()
+        else:
+            min_dt = frame["date"].min().to_pydatetime()
+            max_dt = frame["date"].max().to_pydatetime()
+        timeranges.append((min_dt, max_dt))
     return (
         min(timeranges, key=operator.itemgetter(0))[0],
         max(timeranges, key=operator.itemgetter(1))[1],

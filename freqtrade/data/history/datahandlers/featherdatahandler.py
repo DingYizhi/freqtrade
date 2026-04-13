@@ -1,5 +1,6 @@
 import logging
 
+import polars as pl
 from pandas import DataFrame, read_feather, to_datetime
 from pyarrow import dataset
 
@@ -60,19 +61,16 @@ class FeatherDataHandler(IDataHandler):
             if not filename.exists():
                 return DataFrame(columns=self._columns)
         try:
-            pairdata = read_feather(filename)
+            pairdata = pl.read_ipc(filename, memory_map=False)
             pairdata.columns = self._columns
-            pairdata = pairdata.astype(
-                dtype={
-                    "open": "float",
-                    "high": "float",
-                    "low": "float",
-                    "close": "float",
-                    "volume": "float",
-                }
+            pairdata = pairdata.with_columns(
+                pl.col("open").cast(pl.Float64),
+                pl.col("high").cast(pl.Float64),
+                pl.col("low").cast(pl.Float64),
+                pl.col("close").cast(pl.Float64),
+                pl.col("volume").cast(pl.Float64),
             )
-            pairdata["date"] = to_datetime(pairdata["date"], unit="ms", utc=True)
-            return pairdata
+            return pairdata.to_pandas()
         except Exception as e:
             logger.exception(
                 f"Error loading data from {filename}. Exception: {e}. Returning empty dataframe."

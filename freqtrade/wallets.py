@@ -318,9 +318,15 @@ class Wallets:
         Calculated as
         (<open_trade stakes> + free amount) * tradable_balance_ratio - <open_trade stakes>
         """
-
+        val_tied_up = Trade.total_open_trades_stakes()
         free = self.get_free(self._stake_currency)
-        return min(self.get_total_stake_amount() - Trade.total_open_trades_stakes(), free)
+        if "available_capital" in self._config:
+            starting_balance = self._config["available_capital"]
+            tot_profit = Trade.get_total_closed_profit()
+            available_amount = starting_balance + tot_profit
+        else:
+            available_amount = (val_tied_up + free) * self._config["tradable_balance_ratio"]
+        return min(available_amount - val_tied_up, free)
 
     def _calculate_unlimited_stake_amount(
         self, available_amount: float, val_tied_up: float, max_open_trades: IntOrInf

@@ -1,31 +1,60 @@
-from numpy import format_float_positional
-from pandas import DataFrame, Series
+import numpy as np
+import polars as pl
+from pandas import DataFrame
 
 
-def get_tick_size_over_time(candles: DataFrame) -> Series:
+class TickSizeLookup:
+    """Pre-computed tick-size lookup using numpy binary search (replaces pandas Series.asof)."""
+
+    __slots__ = ("_ts_ns", "_values")
+
+    def __init__(self, ts_ns: np.ndarray, values: np.ndarray):
+        self._ts_ns = ts_ns  # int64 nanosecond timestamps
+        self._values = values
+
+    def asof(self, dt) -> float:
+        ts = int(dt.timestamp() * 1_000_000_000)
+        idx = np.searchsorted(self._ts_ns, ts, side="right") - 1
+        if idx < 0:
+            return float("nan")
+        return self._values[idx]
+
+
+def get_tick_size_over_time(candles: DataFrame) -> TickSizeLookup:
     """
     Calculate the number of significant digits for candles over time.
-    It's using the Monthly maximum of the number of significant digits for each month.
-    :param candles: DataFrame with OHLCV data
-    :return: Series with the average number of significant digits for each month
+    Uses the monthly maximum of the number of significant digits.
+    Returns a TickSizeLookup for fast asof-style queries.
     """
-    # count the number of significant digits for the open and close prices
+    df = pl.from_pandas(candles[["date", "open", "high", "low", "close"]])
+
+    # Vectorized: cast float to string, extract significant decimal digits count
+    count_exprs = []
     for col in ["open", "high", "low", "close"]:
-        candles[f"{col}_count"] = (
-            candles[col]
-            .apply(format_float_positional, precision=14, unique=False, fractional=False, trim="-")
-            .str.extract(r"\.(\d*[1-9])")[0]
-            .str.len()
+        count_exprs.append(
+            pl.col(col).cast(pl.Utf8)
+            .str.extract(r"\.(\d*[1-9])", 1)
+            .str.len_chars()
+            .alias(f"{col}_count")
         )
-    candles["max_count"] = candles[["open_count", "close_count", "high_count", "low_count"]].max(
-        axis=1
+
+    df = df.with_columns(count_exprs)
+    df = df.with_columns(
+        pl.max_horizontal("open_count", "high_count", "low_count", "close_count")
+        .alias("max_count")
     )
 
-    candles1 = candles.set_index("date", drop=True)
-    # Group by month and calculate the average number of significant digits
-    monthly_count_avg1 = candles1["max_count"].resample("MS").max()
-    # monthly_open_count_avg
-    # convert monthly_open_count_avg from 5.0 to 0.00001, 4.0 to 0.0001, ...
-    monthly_open_count_avg = 1 / 10**monthly_count_avg1
+    # Group by month start, take max significant digits
+    monthly = (
+        df.group_by_dynamic("date", every="1mo")
+        .agg(pl.col("max_count").max())
+    )
 
-    return monthly_open_count_avg
+    # Convert digit count to tick size: 2 -> 0.01, 5 -> 0.00001
+    monthly = monthly.with_columns(
+        (1.0 / (10.0 ** pl.col("max_count"))).alias("tick_size")
+    )
+
+    ts_ns = monthly["date"].to_numpy().astype("datetime64[ns]").astype(np.int64)
+    values = monthly["tick_size"].to_numpy().astype(np.float64)
+    return TickSizeLookup(ts_ns, values)

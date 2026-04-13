@@ -5,9 +5,11 @@ This module defines the interface to apply for strategies
 
 import logging
 from abc import ABC, abstractmethod
+from bisect import bisect_right
 from datetime import UTC, datetime, timedelta
 from math import isinf, isnan
 
+import polars as pl
 from pandas import DataFrame
 
 from freqtrade.configuration import TimeRange
@@ -206,6 +208,21 @@ class IStrategy(ABC, HyperStrategyMixin):
         Clean up FreqAI and child threads
         """
         self.freqai.shutdown()
+
+    def _init_bt_wrappers(self) -> None:
+        """Pre-resolve strategy_safe_wrapper for backtesting hot path."""
+        self._w_custom_exit = strategy_safe_wrapper(self.custom_exit, default_retval=False)
+        self._w_custom_stoploss = strategy_safe_wrapper(
+            self.custom_stoploss, default_retval=None, supress_error=True
+        )
+        self._w_custom_roi = strategy_safe_wrapper(
+            self.custom_roi, default_retval=None, supress_error=True
+        )
+        self._w_adjust_trade_position = strategy_safe_wrapper(
+            self.adjust_trade_position, default_retval=(None, ""), supress_error=True
+        )
+        # Pre-sort ROI keys for bisect lookup
+        self._minimal_roi_keys = sorted(self.minimal_roi.keys())
 
     @abstractmethod
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -997,9 +1014,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         wrapper around adjust_trade_position to handle the return value
         """
-        resp = strategy_safe_wrapper(
-            self.adjust_trade_position, default_retval=(None, ""), supress_error=True
-        )(
+        resp = self._w_adjust_trade_position(
             trade=trade,
             current_time=current_time,
             current_rate=current_rate,
@@ -1378,12 +1393,24 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         exits: list[ExitCheckTuple] = []
         current_rate = rate
-        current_profit = trade.calc_profit_ratio(current_rate)
+
+        # Precompute profit factor to avoid repeated calc_profit_ratio calls
+        k = trade.profit_ratio_factor()
+        lev = trade.leverage
+        is_short = trade.is_short
+        if is_short:
+            current_profit = float(f"{lev - current_rate * k:.8f}")
+        else:
+            current_profit = float(f"{current_rate * k - lev:.8f}")
+
         current_profit_best = current_profit
         if low is not None or high is not None:
             # Set current rate to high for backtesting ROI exits
-            current_rate_best = (low if trade.is_short else high) or rate
-            current_profit_best = trade.calc_profit_ratio(current_rate_best)
+            current_rate_best = (low if is_short else high) or rate
+            if is_short:
+                current_profit_best = float(f"{lev - current_rate_best * k:.8f}")
+            else:
+                current_profit_best = float(f"{current_rate_best * k - lev:.8f}")
 
         trade.adjust_min_max_rates(high or current_rate, low or current_rate)
 
@@ -1395,6 +1422,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             force_stoploss=force_stoploss,
             low=low,
             high=high,
+            bound_profit=current_profit_best,
         )
 
         # if enter signal and ignore_roi is set, we don't need to evaluate min_roi.
@@ -1409,7 +1437,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             if exit_ and not enter:
                 exit_signal = ExitType.EXIT_SIGNAL
             else:
-                reason_cust = strategy_safe_wrapper(self.custom_exit, default_retval=False)(
+                reason_cust = self._w_custom_exit(
                     pair=trade.pair,
                     trade=trade,
                     current_time=current_time,
@@ -1470,6 +1498,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         low: float | None = None,
         high: float | None = None,
         after_fill: bool = False,
+        bound_profit: float | None = None,
     ) -> None:
         """
         Adjust stop-loss dynamically if configured to do so.
@@ -1494,11 +1523,10 @@ class IStrategy(ABC, HyperStrategyMixin):
 
         # Make sure current_profit is calculated using high for backtesting.
         bound = low if trade.is_short else high
-        bound_profit = current_profit if not bound else trade.calc_profit_ratio(bound)
+        if bound_profit is None:
+            bound_profit = current_profit if not bound else trade.calc_profit_ratio(bound)
         if self.use_custom_stoploss and dir_correct:
-            stop_loss_value_custom = strategy_safe_wrapper(
-                self.custom_stoploss, default_retval=None, supress_error=True
-            )(
+            stop_loss_value_custom = self._w_custom_stoploss(
                 pair=trade.pair,
                 trade=trade,
                 current_time=current_time,
@@ -1543,6 +1571,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         force_stoploss: float,
         low: float | None = None,
         high: float | None = None,
+        bound_profit: float | None = None,
     ) -> ExitCheckTuple:
         """
         Based on current profit of the trade and configured (trailing) stoploss,
@@ -1552,7 +1581,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         :param high: High value of this candle, only set in backtesting
         """
         self.ft_stoploss_adjust(
-            current_rate, trade, current_time, current_profit, force_stoploss, low, high
+            current_rate, trade, current_time, current_profit, force_stoploss, low, high,
+            bound_profit=bound_profit,
         )
 
         sl_higher_long = trade.stop_loss >= (low or current_rate) and not trade.is_short
@@ -1610,9 +1640,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         # Get custom ROI if use_custom_roi is set to True
         custom_roi = None
         if self.use_custom_roi:
-            custom_roi = strategy_safe_wrapper(
-                self.custom_roi, default_retval=None, supress_error=True
-            )(
+            custom_roi = self._w_custom_roi(
                 pair=trade.pair,
                 trade=trade,
                 current_time=current_time,
@@ -1625,9 +1653,11 @@ class IStrategy(ABC, HyperStrategyMixin):
                 logger.debug(f"Custom ROI function did not return a valid ROI for {trade.pair}")
 
         # Get highest entry in ROI dict where key <= trade-duration
-        roi_list = [x for x in self.minimal_roi.keys() if x <= trade_dur]
-        if roi_list:
-            roi_entry = max(roi_list)
+        # Uses pre-sorted _minimal_roi_keys with bisect for O(log n) lookup
+        keys = self._minimal_roi_keys
+        idx = bisect_right(keys, trade_dur) - 1
+        if idx >= 0:
+            roi_entry = keys[idx]
             min_roi = self.minimal_roi[roi_entry]
         else:
             roi_entry = None
@@ -1647,7 +1677,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         :return: True if bot should exit at current rate
         """
         # Check if time matches and current rate is above threshold
-        trade_dur = int((current_time.timestamp() - trade.open_date_utc.timestamp()) // 60)
+        open_ts = getattr(trade, '_open_date_ts', None) or trade.open_date_utc.timestamp()
+        trade_dur = int((current_time.timestamp() - open_ts) // 60)
         _, roi = self.min_roi_reached_entry(trade, trade_dur, current_time)
         if roi is None:
             return False
@@ -1679,7 +1710,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             pair=trade.pair, trade=trade, order=order, current_time=current_time
         )
 
-    def advise_all_indicators(self, data: dict[str, DataFrame]) -> dict[str, DataFrame]:
+    def advise_all_indicators(self, data: dict[str, DataFrame]) -> dict[str, pl.DataFrame]:
         """
         Populates indicators for given candle (OHLCV) data (for multiple pairs)
         Does not run advise_entry or advise_exit!
@@ -1691,20 +1722,22 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         res = {}
         for pair, pair_data in data.items():
+            pair_pl = pl.from_pandas(pair_data)
             validator = StrategyResultValidator(
-                pair_data, warn_only=not self.disable_dataframe_checks
+                pair_pl, warn_only=not self.disable_dataframe_checks
             )
-            res[pair] = self.advise_indicators(pair_data.copy(), {"pair": pair}).copy()
-            validator.assert_df(res[pair])
+            result_pl = self.advise_indicators(pair_pl.clone(), {"pair": pair})
+            validator.assert_df(result_pl)
+            res[pair] = result_pl
         return res
 
-    def ft_advise_signals(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def ft_advise_signals(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Call advise_entry and advise_exit and return the resulting dataframe.
-        :param dataframe: Dataframe containing data from exchange, as well as pre-calculated
+        :param dataframe: polars DataFrame containing data from exchange, as well as pre-calculated
                           indicators
         :param metadata: Metadata dictionary with additional data (e.g. 'pair')
-        :return: DataFrame of candle (OHLCV) data with indicator data and signals added
+        :return: polars DataFrame of candle (OHLCV) data with indicator data and signals added
 
         """
 
@@ -1739,64 +1772,54 @@ class IStrategy(ABC, HyperStrategyMixin):
             logger.debug("Populated dataframe with trades.")
         return dataframe
 
-    def advise_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def advise_indicators(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Populate indicators that will be used in the Buy, Sell, short, exit_short strategy
         This method should not be overridden.
-        :param dataframe: Dataframe with data from the exchange
+        :param dataframe: polars DataFrame with data from the exchange
         :param metadata: Additional information, like the currently traded pair
-        :return: a Dataframe with all mandatory indicators for the strategies
+        :return: a polars DataFrame with all mandatory indicators for the strategies
         """
         logger.debug(f"Populating indicators for pair {metadata.get('pair')}.")
 
-        # call populate_indicators_Nm() which were tagged with @informative decorator.
-        for inf_data, populate_fn in self._ft_informative:
-            dataframe = _create_and_merge_informative_pair(
-                self, dataframe, metadata, inf_data, populate_fn
-            )
-
-        dataframe = self._if_enabled_populate_trades(dataframe, metadata)
         dataframe = self.populate_indicators(dataframe, metadata)
-        if self.config.get("reduce_df_footprint", False) and self.config.get("runmode") not in [
-            RunMode.DRY_RUN,
-            RunMode.LIVE,
-        ]:
-            dataframe = reduce_dataframe_footprint(dataframe)
         return dataframe
 
-    def advise_entry(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def advise_entry(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Based on TA indicators, populates the entry order signal for the given dataframe
         This method should not be overridden.
-        :param dataframe: DataFrame
+        :param dataframe: polars DataFrame
         :param metadata: Additional information dictionary, with details like the
             currently traded pair
-        :return: DataFrame with buy column
+        :return: polars DataFrame with buy column
         """
 
         logger.debug(f"Populating enter signals for pair {metadata.get('pair')}.")
-        # Initialize column to work around Pandas bug #56503.
-        dataframe.loc[:, "enter_tag"] = ""
+        # Initialize enter_tag column
+        if "enter_tag" not in dataframe.columns:
+            dataframe = dataframe.with_columns(pl.lit("").alias("enter_tag"))
         df = self.populate_entry_trend(dataframe, metadata)
-        if "enter_long" not in df.columns:
-            df = df.rename({"buy": "enter_long", "buy_tag": "enter_tag"}, axis="columns")
+        if "enter_long" not in df.columns and "buy" in df.columns:
+            df = df.rename({"buy": "enter_long", "buy_tag": "enter_tag"})
 
         return df
 
-    def advise_exit(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def advise_exit(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Based on TA indicators, populates the exit order signal for the given dataframe
         This method should not be overridden.
-        :param dataframe: DataFrame
+        :param dataframe: polars DataFrame
         :param metadata: Additional information dictionary, with details like the
             currently traded pair
-        :return: DataFrame with exit column
+        :return: polars DataFrame with exit column
         """
-        # Initialize column to work around Pandas bug #56503.
-        dataframe.loc[:, "exit_tag"] = ""
+        # Initialize exit_tag column
+        if "exit_tag" not in dataframe.columns:
+            dataframe = dataframe.with_columns(pl.lit("").alias("exit_tag"))
         logger.debug(f"Populating exit signals for pair {metadata.get('pair')}.")
         df = self.populate_exit_trend(dataframe, metadata)
-        if "exit_long" not in df.columns:
-            df = df.rename({"sell": "exit_long"}, axis="columns")
+        if "exit_long" not in df.columns and "sell" in df.columns:
+            df = df.rename({"sell": "exit_long"})
         return df
 

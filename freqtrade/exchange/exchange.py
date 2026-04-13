@@ -750,48 +750,71 @@ class Exchange:
         limit: Literal["min", "max"],
         leverage: float = 1.0,
     ) -> float | None:
-        isMin = limit == "min"
+        """
+        Cached version: precomputes price-independent parts per (pair, stoploss, limit, leverage).
+        """
+        cache_key = (pair, stoploss, limit, leverage)
 
-        try:
-            market = self.markets[pair]
-        except KeyError:
-            raise ValueError(f"Can't get market information for symbol {pair}")
+        if not hasattr(self, "_stake_limit_cache"):
+            self._stake_limit_cache: dict = {}
+
+        cached = self._stake_limit_cache.get(cache_key)
+        if cached is None:
+            isMin = limit == "min"
+
+            try:
+                market = self.markets[pair]
+            except KeyError:
+                raise ValueError(f"Can't get market information for symbol {pair}")
+
+            limits = market["limits"]
+            if isMin:
+                margin_reserve: float = 1.0 + self._config.get(
+                    "amount_reserve_percent", DEFAULT_AMOUNT_RESERVE_PERCENT
+                )
+                stoploss_reserve = (
+                    margin_reserve / (1 - abs(stoploss)) if abs(stoploss) != 1 else 1.5
+                )
+                stoploss_reserve = max(min(stoploss_reserve, 1.5), 1)
+            else:
+                margin_reserve = 1.0
+                stoploss_reserve = 1.0
+
+            # Price-independent cost limit
+            cost_limit: float | None = None
+            if limits["cost"][limit] is not None:
+                cost_limit = self._contracts_to_amount(pair, limits["cost"][limit]) * stoploss_reserve
+
+            # Amount limit factor (needs to be multiplied by price)
+            amount_factor: float | None = None
+            if limits["amount"][limit] is not None:
+                amount_factor = (
+                    self._contracts_to_amount(pair, limits["amount"][limit]) * margin_reserve
+                )
+
+            # Tier limit (max only)
+            tier_limit: float | None = None
+            if not isMin:
+                tier_limit = self._get_max_notional_from_tiers(pair, leverage=leverage)
+
+            cached = (isMin, cost_limit, amount_factor, tier_limit, leverage)
+            self._stake_limit_cache[cache_key] = cached
+
+        isMin, cost_limit, amount_factor, tier_limit, lev = cached
 
         stake_limits = []
-        limits = market["limits"]
-        if isMin:
-            # reserve some percent defined in config (5% default) + stoploss
-            margin_reserve: float = 1.0 + self._config.get(
-                "amount_reserve_percent", DEFAULT_AMOUNT_RESERVE_PERCENT
-            )
-            stoploss_reserve = margin_reserve / (1 - abs(stoploss)) if abs(stoploss) != 1 else 1.5
-            # it should not be more than 50%
-            stoploss_reserve = max(min(stoploss_reserve, 1.5), 1)
-        else:
-            # is_max
-            margin_reserve = 1.0
-            stoploss_reserve = 1.0
-            if max_from_tiers := self._get_max_notional_from_tiers(pair, leverage=leverage):
-                stake_limits.append(max_from_tiers)
-
-        if limits["cost"][limit] is not None:
-            stake_limits.append(
-                self._contracts_to_amount(pair, limits["cost"][limit]) * stoploss_reserve
-            )
-
-        if limits["amount"][limit] is not None:
-            stake_limits.append(
-                self._contracts_to_amount(pair, limits["amount"][limit]) * price * margin_reserve
-            )
+        if tier_limit is not None:
+            stake_limits.append(tier_limit)
+        if cost_limit is not None:
+            stake_limits.append(cost_limit)
+        if amount_factor is not None:
+            stake_limits.append(amount_factor * price)
 
         if not stake_limits:
             return None if isMin else float("inf")
 
-        # The value returned should satisfy both limits: for amount (base currency) and
-        # for cost (quote, stake currency), so max() is used here.
-        # See also #2575 at github.
         return self._get_stake_amount_considering_leverage(
-            max(stake_limits) if isMin else min(stake_limits), leverage or 1.0
+            max(stake_limits) if isMin else min(stake_limits), lev or 1.0
         )
 
     def _get_stake_amount_considering_leverage(self, stake_amount: float, leverage: float) -> float:

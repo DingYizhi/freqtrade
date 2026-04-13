@@ -10,6 +10,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 
 from numpy import isnan, nan
+import polars as pl
 from pandas import DataFrame, Series
 
 from freqtrade import constants
@@ -124,7 +125,7 @@ class Backtesting:
         self.order_id_counter: int = 0
 
         self.config["dry_run"] = True
-        self.price_pair_prec: dict[str, Series] = {}
+        self.price_pair_prec: dict = {}
         self.available_pairs: list[str] = []
         self.run_ids: dict[str, str] = {}
         self.strategylist: list[IStrategy] = []
@@ -427,9 +428,9 @@ class Backtesting:
             self.abort = False
             raise DependencyException("Stop requested")
 
-    def _get_ohlcv_as_lists(self, processed: dict[str, DataFrame]) -> dict[str, tuple]:
+    def _get_ohlcv_as_lists(self, processed: dict[str, pl.DataFrame]) -> dict[str, tuple]:
         """
-        Helper function to convert a processed dataframes into lists for performance reasons.
+        Helper function to convert processed polars dataframes into lists for performance reasons.
 
         Used by backtest() - so keep this optimized for performance.
 
@@ -446,42 +447,56 @@ class Backtesting:
             self.check_abort()
             self.progress.increment()
 
-            if not pair_data.empty:
-                # Cleanup from prior runs
-                pair_data.drop(HEADERS[5:] + ["buy", "sell"], axis=1, errors="ignore")
+            # Cleanup from prior runs - drop signal columns if they exist
+            cols_to_drop = [c for c in HEADERS[5:] + ["buy", "sell"] if c in pair_data.columns]
+            if cols_to_drop:
+                pair_data = pair_data.drop(cols_to_drop)
+
             df_analyzed = self.strategy.ft_advise_signals(pair_data, {"pair": pair})
-            # Update dataprovider cache
+
+            # Update dataprovider cache BEFORE trimming (strategy callbacks need full data)
             self.dataprovider._set_cached_df(
                 pair, self.timeframe, df_analyzed, self.config["candle_type_def"]
             )
 
             # Trim startup period from analyzed dataframe
-            df_analyzed = processed[pair] = pair_data = trim_dataframe(
-                df_analyzed, self.timerange, startup_candles=self.required_startup
-            )
+            if self.required_startup:
+                df_analyzed = df_analyzed.slice(self.required_startup)
+            if self.timerange.starttype == "date":
+                df_analyzed = df_analyzed.filter(pl.col("date") >= self.timerange.startdt)
+            if self.timerange.stoptype == "date":
+                df_analyzed = df_analyzed.filter(pl.col("date") <= self.timerange.stopdt)
 
-            # Create a copy of the dataframe before shifting, that way the entry signal/tag
-            # remains on the correct candle for callbacks.
-            df_analyzed = df_analyzed.copy()
+            processed[pair] = df_analyzed
 
-            # To avoid using data from future, we use entry/exit signals shifted
-            # from the previous candle
+            # Shift signals by 1 to avoid lookahead bias
+            shift_exprs = []
             for col in HEADERS[5:]:
                 tag_col = col in ("enter_tag", "exit_tag")
                 if col in df_analyzed.columns:
-                    df_analyzed[col] = (
-                        df_analyzed.loc[:, col]
-                        .replace([nan], [0 if not tag_col else None])
-                        .shift(1)
-                    )
-                elif not df_analyzed.empty:
-                    df_analyzed[col] = 0 if not tag_col else None
+                    if tag_col:
+                        shift_exprs.append(pl.col(col).shift(1).alias(col))
+                    else:
+                        shift_exprs.append(
+                            pl.col(col).shift(1).fill_null(0).alias(col)
+                        )
+                else:
+                    if tag_col:
+                        shift_exprs.append(pl.lit(None).cast(pl.Utf8).alias(col))
+                    else:
+                        shift_exprs.append(pl.lit(0).alias(col))
 
-            df_analyzed = df_analyzed.drop(df_analyzed.head(1).index)
+            df_shifted = df_analyzed.with_columns(shift_exprs)
+            # Drop first row (shifted row has null signals)
+            df_shifted = df_shifted.slice(1)
 
-            # Convert from Pandas to list for performance reasons
-            # (Looping Pandas is slow.)
-            data[pair] = df_analyzed[HEADERS].values.tolist() if not df_analyzed.empty else []
+            # Convert to list of lists for hot loop performance
+            if len(df_shifted) > 0:
+                # Pre-convert dates to Python datetime objects
+                rows = df_shifted.select(HEADERS).rows()
+                data[pair] = rows
+            else:
+                data[pair] = []
         return data
 
     def _get_close_rate(
@@ -632,25 +647,35 @@ class Backtesting:
         self, trade: LocalTrade, row: tuple, current_time: datetime
     ) -> LocalTrade:
         current_rate: float = row[OPEN_IDX]
-        current_profit = trade.calc_profit_ratio(current_rate)
-        min_stake = self.exchange.get_min_pair_stake_amount(trade.pair, current_rate, -0.1)
-        max_stake = self.exchange.get_max_pair_stake_amount(trade.pair, current_rate)
-        stake_available = self.wallets.get_available_stake_amount()
+        # Use factor-based fast profit ratio
+        k = trade.profit_ratio_factor()
+        lev = trade.leverage
+        if trade.is_short:
+            current_profit = float(f"{lev - current_rate * k:.8f}")
+        else:
+            current_profit = float(f"{current_rate * k - lev:.8f}")
         stake_amount, order_tag = self.strategy._adjust_trade_position_internal(
             trade=trade,  # type: ignore[arg-type]
             current_time=current_time,
             current_rate=current_rate,
             current_profit=current_profit,
-            min_stake=min_stake,
-            max_stake=min(max_stake, stake_available),
+            min_stake=None,
+            max_stake=self.wallets.get_available_stake_amount(),
             current_entry_rate=current_rate,
             current_exit_rate=current_rate,
             current_entry_profit=current_profit,
             current_exit_profit=current_profit,
         )
 
+        if stake_amount is None:
+            return trade
+
+        # Only compute expensive values when strategy actually wants to adjust
+        min_stake = self.exchange.get_min_pair_stake_amount(trade.pair, current_rate, -0.1)
+        max_stake = self.exchange.get_max_pair_stake_amount(trade.pair, current_rate)
+
         # Check if we should increase our position
-        if stake_amount is not None and stake_amount > 0.0:
+        if stake_amount > 0.0:
             check_adjust_entry = True
             if self.strategy.max_entry_position_adjustment > -1:
                 entry_count = trade.nr_of_successful_entries
@@ -668,7 +693,7 @@ class Backtesting:
                     self.wallets.update()
                     return pos_trade
 
-        if stake_amount is not None and stake_amount < 0.0:
+        if stake_amount < 0.0:
             amount = amount_to_contract_precision(
                 abs(
                     float(
@@ -722,7 +747,7 @@ class Backtesting:
         if order and self._get_order_filled(order.ft_price, row):
             order.close_bt_order(current_date, trade)
             self._run_funding_fees(trade, current_date, force=True)
-            strategy_safe_wrapper(self.strategy.order_filled, supress_error=True)(
+            self._w_order_filled(
                 pair=trade.pair,
                 trade=trade,  # type: ignore[arg-type]
                 order=order,
@@ -800,9 +825,7 @@ class Backtesting:
                     exit_reason = row[EXIT_TAG_IDX]
                 # Custom exit pricing only for exit-signals
                 if order_type == "limit":
-                    rate = strategy_safe_wrapper(
-                        self.strategy.custom_exit_price, default_retval=close_rate
-                    )(
+                    rate = self._w_custom_exit_price(
                         pair=trade.pair,
                         trade=trade,  # type: ignore[arg-type]
                         current_time=current_time,
@@ -824,7 +847,7 @@ class Backtesting:
             if exit_.exit_type not in (
                 ExitType.LIQUIDATION,
                 ExitType.PARTIAL_EXIT,
-            ) and not strategy_safe_wrapper(self.strategy.confirm_trade_exit, default_retval=True)(
+            ) and not self._w_confirm_trade_exit(
                 pair=trade.pair,
                 trade=trade,  # type: ignore[arg-type]
                 order_type=order_type,
@@ -851,7 +874,7 @@ class Backtesting:
         exit_reason: str | None,
     ) -> LocalTrade | None:
         self.order_id_counter += 1
-        exit_candle_time = sell_row[DATE_IDX].to_pydatetime()
+        exit_candle_time = sell_row[DATE_IDX]
         order_type = self.strategy.order_types["exit"]
         close_rate = price_to_precision(
             close_rate, trade.price_precision, trade.precision_mode_price
@@ -905,7 +928,7 @@ class Backtesting:
             exits = self.strategy.should_exit(
                 trade,  # type: ignore
                 row[OPEN_IDX],
-                row[DATE_IDX].to_pydatetime(),
+                row[DATE_IDX],
                 enter=enter,
                 exit_=exit_sig,
                 low=row[LOW_IDX],
@@ -949,9 +972,7 @@ class Backtesting:
         precision_mode_price: int,
     ) -> tuple[float, float, float, float]:
         if order_type == "limit":
-            new_rate = strategy_safe_wrapper(
-                self.strategy.custom_entry_price, default_retval=propose_rate
-            )(
+            new_rate = self._w_custom_entry_price(
                 pair=pair,
                 trade=trade,  # type: ignore[arg-type]
                 current_time=current_time,
@@ -980,7 +1001,7 @@ class Backtesting:
 
             max_leverage = self.exchange.get_max_leverage(pair, stake_amount)
             leverage = (
-                strategy_safe_wrapper(self.strategy.leverage, default_retval=1.0)(
+                self._w_leverage(
                     pair=pair,
                     current_time=current_time,
                     current_rate=row[OPEN_IDX],
@@ -1007,9 +1028,7 @@ class Backtesting:
         stake_available = self.wallets.get_available_stake_amount()
 
         if not pos_adjust:
-            stake_amount = strategy_safe_wrapper(
-                self.strategy.custom_stake_amount, default_retval=stake_amount
-            )(
+            _sa = self._w_custom_stake_amount(
                 pair=pair,
                 current_time=current_time,
                 current_rate=propose_rate,
@@ -1020,6 +1039,8 @@ class Backtesting:
                 entry_tag=entry_tag,
                 side=direction,
             )
+            if _sa is not None:
+                stake_amount = _sa
 
         stake_amount_val = self.wallets.validate_stake_amount(
             pair=pair,
@@ -1048,7 +1069,7 @@ class Backtesting:
         :param requested_stake: Stake amount for adjusted orders (`adjust_entry_price`).
         """
 
-        current_time = row[DATE_IDX].to_pydatetime()
+        current_time = row[DATE_IDX]
         entry_tag = entry_tag1 or (row[ENTER_TAG_IDX] if len(row) >= ENTER_TAG_IDX + 1 else None)
         # let's call the custom entry price, using the open price as default price
         order_type = self.strategy.order_types["entry"]
@@ -1101,9 +1122,7 @@ class Backtesting:
 
             if not pos_adjust:
                 # Confirm trade entry:
-                if not strategy_safe_wrapper(
-                    self.strategy.confirm_trade_entry, default_retval=True
-                )(
+                if not self._w_confirm_trade_entry(
                     pair=pair,
                     order_type=order_type,
                     amount=amount,
@@ -1209,7 +1228,7 @@ class Backtesting:
                 )
                 trade.exit_reason = ExitType.FORCE_EXIT.value
                 self._process_exit_order(
-                    trade.orders[-1], trade, exit_row[DATE_IDX].to_pydatetime(), exit_row, pair
+                    trade.orders[-1], trade, exit_row[DATE_IDX], exit_row, pair
                 )
 
     def trade_slot_available(self, open_trade_count: int) -> bool:
@@ -1329,9 +1348,7 @@ class Backtesting:
         # only check on new candles for open entry orders
         if current_time > order.order_date_utc:
             is_entry = order.side == trade.entry_side
-            requested_rate = strategy_safe_wrapper(
-                self.strategy.adjust_order_price, default_retval=order.ft_price
-            )(
+            requested_rate = self._w_adjust_order_price(
                 trade=trade,  # type: ignore[arg-type]
                 order=order,
                 pair=trade.pair,
@@ -1342,6 +1359,8 @@ class Backtesting:
                 side=trade.trade_direction,
                 is_entry=is_entry,
             )  # default value is current order price
+            if requested_rate is None:
+                requested_rate = order.ft_price
 
             # cancel existing order whenever a new rate is requested (or None)
             if requested_rate == order.ft_price:
@@ -1480,7 +1499,7 @@ class Backtesting:
         """
         Spread into detail data
         """
-        current_detail_time: datetime = row[DATE_IDX].to_pydatetime()
+        current_detail_time: datetime = row[DATE_IDX]
         exit_candle_end = current_detail_time + self.timeframe_td
         detail_data = self.detail_data[pair]
         detail_data = detail_data.loc[
@@ -1524,7 +1543,12 @@ class Backtesting:
             current_time, current_time + self.timeframe_td
         ):
             # Pairs that have open trades should be processed first
-            new_pairlist = list(dict.fromkeys([t.pair for t in LocalTrade.bt_trades_open] + pairs))
+            if LocalTrade.bt_trades_open:
+                new_pairlist = list(
+                    dict.fromkeys([t.pair for t in LocalTrade.bt_trades_open] + pairs)
+                )
+            else:
+                new_pairlist = pairs
             for pair in new_pairlist:
                 yield current_time_det, is_first, has_detail, idx, pair
 
@@ -1540,23 +1564,88 @@ class Backtesting:
         :returns: generator of (current_time, pair, row, is_last_row, trade_dir)
             where is_last_row is a boolean indicating if this is the data end date.
         """
-        current_time = start_date + self.timeframe_td
+        if self.timeframe_detail_td:
+            yield from self._time_pair_generator_full(start_date, end_date, pairs, data)
+            return
+
+        # Simplified fast path: no detail timeframe
         self.progress.init_step(
             BacktestState.BACKTEST, int((end_date - start_date) / self.timeframe_td)
         )
-        # Indexes per pair, so some pairs are allowed to have a missing start.
+        indexes: dict = defaultdict(int)
+        timeframe_td = self.timeframe_td
+        has_bot_loop = self._has_bot_loop_start
+        check_abort = self.check_abort
+        validate_row = self.validate_row
+        dp_set_max_index = self.dataprovider._set_dataframe_max_index
+        dp_set_max_date = self.dataprovider._set_dataframe_max_date
+        check_entry = self.check_for_trade_entry
+        required_startup = self.required_startup
+        bt_trades_open = LocalTrade.bt_trades_open
+        bt_trades_open_pp = LocalTrade.bt_trades_open_pp
+        progress_increment = self.progress.increment
+
+        current_time = start_date + timeframe_td
+        while current_time <= end_date:
+            check_abort()
+            if has_bot_loop:
+                self._w_bot_loop_start(current_time=current_time)
+
+            pairs_with_open_trades = [t.pair for t in bt_trades_open]
+
+            # No detail: is_first=True, has_detail=False always
+            # Build pairlist: open trade pairs first
+            if bt_trades_open:
+                pairlist = list(dict.fromkeys(
+                    [t.pair for t in bt_trades_open] + pairs
+                ))
+            else:
+                pairlist = pairs
+
+            for pair in pairlist:
+                row_index = indexes[pair]
+                row = validate_row(data, pair, row_index, current_time)
+                if not row:
+                    continue
+
+                row_index += 1
+                indexes[pair] = row_index
+                dp_set_max_index(pair, required_startup + row_index)
+                trade_dir = check_entry(row)
+
+                dp_set_max_date(current_time)
+
+                pair_has_open_trades = len(bt_trades_open_pp[pair]) > 0
+                if pair in pairs_with_open_trades and not pair_has_open_trades:
+                    continue
+                if pair_has_open_trades and pair not in pairs_with_open_trades:
+                    pairs_with_open_trades.append(pair)
+
+                is_last_row = current_time == end_date
+                yield current_time, pair, row, is_last_row, trade_dir
+
+            progress_increment()
+            current_time += timeframe_td
+
+    def _time_pair_generator_full(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        pairs: list[str],
+        data: dict[str, list[tuple]],
+    ):
+        """Full version with detail timeframe support."""
+        self.progress.init_step(
+            BacktestState.BACKTEST, int((end_date - start_date) / self.timeframe_td)
+        )
         indexes: dict = defaultdict(int)
 
         for current_time in self._time_generator(start_date, end_date):
-            # Loop for each main candle.
             self.check_abort()
 
-            # Reset open trade count for this candle
-            # Critical to avoid exceeding max_open_trades in backtesting
-            # when timeframe-detail is used and trades close within the opening candle.
-            strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
+            self._w_bot_loop_start(
                 current_time=current_time
-            )
+            ) if self._has_bot_loop_start else None
             pair_detail_cache: dict[str, list[tuple]] = {}
             pair_tradedir_cache: dict[str, LongShort | None] = {}
             pairs_with_open_trades = [t.pair for t in LocalTrade.bt_trades_open]
@@ -1564,13 +1653,8 @@ class Backtesting:
             for current_time_det, is_first, has_detail, idx, pair in self._time_pair_generator_det(
                 current_time, pairs
             ):
-                # Loop for each detail candle (if necessary) and pair
-                # Yields only the main date if no detail timeframe is set.
-
-                # Pairs that have open trades should be processed first
                 trade_dir: LongShort | None = None
                 if is_first:
-                    # Main candle
                     row_index = indexes[pair]
                     row = self.validate_row(data, pair, row_index, current_time)
                     if not row:
@@ -1586,34 +1670,26 @@ class Backtesting:
                     pair_tradedir_cache[pair] = trade_dir
 
                 else:
-                    # Detail candle - from cache.
                     detail_data = pair_detail_cache.get(pair)
                     if detail_data is None or len(detail_data) <= idx:
-                        # logger.info(f"skipping {pair}, {current_time_det}, {trade_dir}")
                         continue
                     row = detail_data[idx]
                     trade_dir = pair_tradedir_cache.get(pair)
 
                     if self.strategy.ignore_expired_candle(
-                        current_time - self.timeframe_td,  # last closed candle is 1 timeframe away.
+                        current_time - self.timeframe_td,
                         current_time_det,
                         self.timeframe_secs,
                         trade_dir is not None,
                     ):
-                        # Ignore late entries eventually
                         trade_dir = None
 
                 self.dataprovider._set_dataframe_max_date(current_time_det)
 
                 pair_has_open_trades = len(LocalTrade.bt_trades_open_pp[pair]) > 0
                 if pair in pairs_with_open_trades and not pair_has_open_trades:
-                    # Pair has had open trades which closed in the current main candle.
-                    # Skip this pair for this timeframe
                     continue
                 if pair_has_open_trades and pair not in pairs_with_open_trades:
-                    # auto-lock for pairs that have open trades
-                    # Necessary for detail - to capture trades that open and close within
-                    # the same main candle
                     pairs_with_open_trades.append(pair)
 
                 if (
@@ -1624,9 +1700,6 @@ class Backtesting:
                     and pair in self.detail_data
                     and row
                 ):
-                    # Spread candle into detail timeframe and cache that -
-                    # only once per main candle
-                    # and only if we can expect activity.
                     pair_detail = self.get_detail_data(pair, row)
                     if pair_detail is not None:
                         pair_detail_cache[pair] = pair_detail
@@ -1656,6 +1729,33 @@ class Backtesting:
         self.reset_backtest()
         # Ensure wallets are up-to-date (important for --strategy-list)
         self.wallets.update()
+        # Check if strategy overrides bot_loop_start (skip if default no-op)
+        self._has_bot_loop_start = type(self.strategy).bot_loop_start is not IStrategy.bot_loop_start
+        # Pre-resolve strategy wrappers for hot loop (avoid tuple+dict lookup per call)
+        self._w_order_filled = strategy_safe_wrapper(self.strategy.order_filled, supress_error=True)
+        self._w_custom_exit_price = strategy_safe_wrapper(
+            self.strategy.custom_exit_price, default_retval=None
+        )
+        self._w_confirm_trade_exit = strategy_safe_wrapper(
+            self.strategy.confirm_trade_exit, default_retval=True
+        )
+        self._w_custom_entry_price = strategy_safe_wrapper(
+            self.strategy.custom_entry_price, default_retval=None
+        )
+        self._w_leverage = strategy_safe_wrapper(self.strategy.leverage, default_retval=1.0)
+        self._w_custom_stake_amount = strategy_safe_wrapper(
+            self.strategy.custom_stake_amount, default_retval=None
+        )
+        self._w_confirm_trade_entry = strategy_safe_wrapper(
+            self.strategy.confirm_trade_entry, default_retval=True
+        )
+        self._w_adjust_order_price = strategy_safe_wrapper(
+            self.strategy.adjust_order_price, default_retval=None
+        )
+        self._w_bot_loop_start = strategy_safe_wrapper(
+            self.strategy.bot_loop_start, supress_error=True
+        )
+        self.strategy._init_bt_wrappers()
         # Use dict of lists with data for performance
         # (looping lists is a lot faster than pandas DataFrames)
         data: dict = self._get_ohlcv_as_lists(processed)

@@ -162,25 +162,43 @@ def trim_dataframe(
 
 
 def trim_dataframes(
-    preprocessed: dict[str, DataFrame], timerange, startup_candles: int
-) -> dict[str, DataFrame]:
+    preprocessed: dict, timerange, startup_candles: int
+) -> dict:
     """
-    Trim startup period from analyzed dataframes
+    Trim startup period from analyzed dataframes (polars or pandas)
     :param preprocessed: Dict of pair: dataframe
     :param timerange: timerange (use start and end date if available)
     :param startup_candles: Startup-candles that should be removed
     :return: Dict of trimmed dataframes
     """
-    processed: dict[str, DataFrame] = {}
+    import polars as pl
+
+    processed: dict = {}
 
     for pair, df in preprocessed.items():
-        trimed_df = trim_dataframe(df, timerange, startup_candles=startup_candles)
-        if not trimed_df.empty:
-            processed[pair] = trimed_df
+        if isinstance(df, pl.DataFrame):
+            trimed_df = df
+            if startup_candles:
+                trimed_df = trimed_df.slice(startup_candles)
+            else:
+                if timerange.starttype == "date":
+                    trimed_df = trimed_df.filter(pl.col("date") >= timerange.startdt)
+            if timerange.stoptype == "date":
+                trimed_df = trimed_df.filter(pl.col("date") <= timerange.stopdt)
+            if len(trimed_df) > 0:
+                processed[pair] = trimed_df
+            else:
+                logger.warning(
+                    f"{pair} has no data left after adjusting for startup candles, skipping."
+                )
         else:
-            logger.warning(
-                f"{pair} has no data left after adjusting for startup candles, skipping."
-            )
+            trimed_df = trim_dataframe(df, timerange, startup_candles=startup_candles)
+            if not trimed_df.empty:
+                processed[pair] = trimed_df
+            else:
+                logger.warning(
+                    f"{pair} has no data left after adjusting for startup candles, skipping."
+                )
     return processed
 
 

@@ -1,6 +1,5 @@
 import logging
 from collections.abc import Callable
-from copy import copy
 from typing import Any, TypeVar, cast
 
 from freqtrade.exceptions import StrategyError
@@ -46,8 +45,6 @@ def strategy_safe_wrapper(f: F, message: str = "", default_retval=None, supress_
 
     def wrapper(*args, **kwargs):
         try:
-            if is_user_method and "trade" in kwargs:
-                kwargs["trade"] = copy(kwargs["trade"])
             return f(*args, **kwargs)
         except ValueError as error:
             traceback = __format_traceback(error)
