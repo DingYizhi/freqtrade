@@ -76,7 +76,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("-d", "--datadir", "--data-dir", dest="datadir")
     parser.add_argument("--data-format-ohlcv", dest="dataformat_ohlcv", choices=constants.AVAILABLE_DATAHANDLERS, default="feather")
     parser.add_argument("--data-format-trades", dest="dataformat_trades", choices=constants.AVAILABLE_DATAHANDLERS, default="feather")
-    parser.add_argument("--export", dest="export", choices=constants.EXPORT_OPTIONS, default="trades")
+    parser.add_argument("--export", dest="export", choices=constants.EXPORT_OPTIONS, default="none")
     parser.add_argument("--backtest-directory", "--export-directory", dest="exportdirectory")
     parser.add_argument("--backtest-filename", "--export-filename", dest="exportfilename")
     parser.add_argument("--breakdown", dest="backtest_breakdown", nargs="+", choices=constants.BACKTEST_BREAKDOWNS)

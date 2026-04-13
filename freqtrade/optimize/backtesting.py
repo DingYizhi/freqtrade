@@ -8,6 +8,7 @@ import logging
 from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from numpy import isnan, nan
 import polars as pl
@@ -71,7 +72,7 @@ from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
 from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy.strategy_wrapper import strategy_safe_wrapper
-from freqtrade.util import FtPrecise, dt_now
+from freqtrade.util import dt_now
 from freqtrade.util.migrations import migrate_data
 from freqtrade.wallets import Wallets
 
@@ -647,13 +648,7 @@ class Backtesting:
         self, trade: LocalTrade, row: tuple, current_time: datetime
     ) -> LocalTrade:
         current_rate: float = row[OPEN_IDX]
-        # Use factor-based fast profit ratio
-        k = trade.profit_ratio_factor()
-        lev = trade.leverage
-        if trade.is_short:
-            current_profit = float(f"{lev - current_rate * k:.8f}")
-        else:
-            current_profit = float(f"{current_rate * k - lev:.8f}")
+        current_profit = trade.calc_profit_ratio(current_rate)
         stake_amount, order_tag = self.strategy._adjust_trade_position_internal(
             trade=trade,  # type: ignore[arg-type]
             current_time=current_time,
@@ -697,9 +692,9 @@ class Backtesting:
             amount = amount_to_contract_precision(
                 abs(
                     float(
-                        FtPrecise(stake_amount)
-                        * FtPrecise(trade.amount)
-                        / FtPrecise(trade.stake_amount)
+                        Decimal(str(stake_amount))
+                        * Decimal(str(trade.amount))
+                        / Decimal(str(trade.stake_amount))
                     )
                 ),
                 trade.amount_precision,

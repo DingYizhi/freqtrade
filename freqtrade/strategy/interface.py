@@ -1394,23 +1394,12 @@ class IStrategy(ABC, HyperStrategyMixin):
         exits: list[ExitCheckTuple] = []
         current_rate = rate
 
-        # Precompute profit factor to avoid repeated calc_profit_ratio calls
-        k = trade.profit_ratio_factor()
-        lev = trade.leverage
-        is_short = trade.is_short
-        if is_short:
-            current_profit = float(f"{lev - current_rate * k:.8f}")
-        else:
-            current_profit = float(f"{current_rate * k - lev:.8f}")
+        current_profit = trade.calc_profit_ratio(current_rate)
 
         current_profit_best = current_profit
         if low is not None or high is not None:
-            # Set current rate to high for backtesting ROI exits
-            current_rate_best = (low if is_short else high) or rate
-            if is_short:
-                current_profit_best = float(f"{lev - current_rate_best * k:.8f}")
-            else:
-                current_profit_best = float(f"{current_rate_best * k - lev:.8f}")
+            current_rate_best = (low if trade.is_short else high) or rate
+            current_profit_best = trade.calc_profit_ratio(current_rate_best)
 
         trade.adjust_min_max_rates(high or current_rate, low or current_rate)
 
