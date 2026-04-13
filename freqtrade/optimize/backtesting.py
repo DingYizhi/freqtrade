@@ -61,6 +61,7 @@ from freqtrade.optimize.optimize_reports import (
 )
 from freqtrade.persistence import (
     CustomDataWrapper,
+    LocalOrder,
     LocalTrade,
     Order,
     PairLocks,
@@ -645,10 +646,12 @@ class Backtesting:
             return row[OPEN_IDX]
 
     def _check_adjust_trade_for_candle(
-        self, trade: LocalTrade, row: tuple, current_time: datetime
+        self, trade: LocalTrade, row: tuple, current_time: datetime,
+        current_profit: float | None = None,
     ) -> LocalTrade:
         current_rate: float = row[OPEN_IDX]
-        current_profit = trade.calc_profit_ratio(current_rate)
+        if current_profit is None:
+            current_profit = trade.calc_profit_ratio(current_rate)
         stake_amount, order_tag = self.strategy._adjust_trade_position_internal(
             trade=trade,  # type: ignore[arg-type]
             current_time=current_time,
@@ -882,7 +885,7 @@ class Backtesting:
         if self.handle_similar_order(trade, close_rate, amount, trade.exit_side, exit_candle_time):
             return None
 
-        order = Order(
+        order = LocalOrder(
             id=self.order_id_counter,
             ft_trade_id=trade.id,
             order_date=exit_candle_time,
@@ -913,21 +916,32 @@ class Backtesting:
     ) -> LocalTrade | None:
         self._run_funding_fees(trade, current_time)
 
+        # Pre-compute profit at open price once — avoids redundant calc in should_exit
+        open_rate = row[OPEN_IDX]
+        current_profit_open = trade.calc_profit_ratio(open_rate)
+
         # Check if we need to adjust our current positions
         if self.strategy.position_adjustment_enable:
-            trade = self._check_adjust_trade_for_candle(trade, row, current_time)
+            old_otv = trade.open_trade_value
+            trade = self._check_adjust_trade_for_candle(
+                trade, row, current_time, current_profit=current_profit_open
+            )
+            # If DCA filled, open_trade_value changed → recompute profit
+            if trade.open_trade_value != old_otv:
+                current_profit_open = trade.calc_profit_ratio(open_rate)
 
         if trade.is_open:
             enter = row[SHORT_IDX] if trade.is_short else row[LONG_IDX]
             exit_sig = row[ESHORT_IDX] if trade.is_short else row[ELONG_IDX]
             exits = self.strategy.should_exit(
                 trade,  # type: ignore
-                row[OPEN_IDX],
+                open_rate,
                 row[DATE_IDX],
                 enter=enter,
                 exit_=exit_sig,
                 low=row[LOW_IDX],
                 high=row[HIGH_IDX],
+                _current_profit=current_profit_open,
             )
             for exit_ in exits:
                 t = self._get_exit_for_signal(trade, row, exit_, current_time)
@@ -940,7 +954,7 @@ class Backtesting:
         Calculate funding fees if necessary and add them to the trade.
         """
         if self.trading_mode == TradingMode.FUTURES:
-            if force or (current_time.timestamp() % self.funding_fee_timeframe_secs) == 0:
+            if force or (getattr(self, '_current_time_ts', None) or current_time.timestamp()) % self.funding_fee_timeframe_secs == 0:
                 # Funding fee interval.
                 trade.set_funding_fees(
                     self.exchange.calculate_funding_fees(
@@ -1172,7 +1186,7 @@ class Backtesting:
 
             trade.adjust_stop_loss(trade.open_rate, self.strategy.stoploss, initial=True)
 
-            order = Order(
+            order = LocalOrder(
                 id=self.order_id_counter,
                 ft_trade_id=trade.id,
                 ft_is_open=True,
@@ -1441,17 +1455,27 @@ class Backtesting:
 
         Backtesting processing for one candle/pair.
         """
-        exiting_dir: LongShort | None = None
-        if not self._position_stacking and len(LocalTrade.bt_trades_open_pp[pair]) > 0:
-            # position_stacking not supported for now.
-            exiting_dir = "short" if LocalTrade.bt_trades_open_pp[pair][0].is_short else "long"
+        # Cache hot attributes as locals to avoid repeated self.xxx lookups
+        bt_trades_open_pp = LocalTrade.bt_trades_open_pp
+        trades_for_pair = bt_trades_open_pp[pair]
+        manage_open_orders = self.manage_open_orders
+        remove_bt_trade = LocalTrade.remove_bt_trade
+        wallets_update = self.wallets.update
+        try_close_open_order = self._try_close_open_order
+        check_trade_exit = self._check_trade_exit
+        process_exit_order = self._process_exit_order
 
-        for t in list(LocalTrade.bt_trades_open_pp[pair]):
+        exiting_dir: LongShort | None = None
+        if not self._position_stacking and len(trades_for_pair) > 0:
+            # position_stacking not supported for now.
+            exiting_dir = "short" if trades_for_pair[0].is_short else "long"
+
+        for t in list(trades_for_pair):
             # 1. Manage currently open orders of active trades
-            if self.manage_open_orders(t, current_time, row):
+            if manage_open_orders(t, current_time, row):
                 # Remove trade (initial open order never filled)
-                LocalTrade.remove_bt_trade(t)
-                self.wallets.update()
+                remove_bt_trade(t)
+                wallets_update()
 
         # 2. Process entries.
         # without positionstacking, we can only have one open trade per pair.
@@ -1461,32 +1485,32 @@ class Backtesting:
         if (
             can_enter
             and trade_dir is not None
-            and (self._position_stacking or len(LocalTrade.bt_trades_open_pp[pair]) == 0)
+            and (self._position_stacking or len(trades_for_pair) == 0)
             and not PairLocks.is_pair_locked(pair, row[DATE_IDX], trade_dir)
         ):
             if self.trade_slot_available(LocalTrade.bt_open_open_trade_count):
                 trade = self._enter_trade(pair, row, trade_dir)
                 if trade:
-                    self.wallets.update()
+                    wallets_update()
             else:
                 self._collate_rejected(pair, row)
 
-        for trade in list(LocalTrade.bt_trades_open_pp[pair]):
+        for trade in list(trades_for_pair):
             # 3. Process entry orders.
             order = trade.select_order(trade.entry_side, is_open=True)
-            if self._try_close_open_order(order, trade, current_time, row):
-                self.wallets.update()
+            if try_close_open_order(order, trade, current_time, row):
+                wallets_update()
 
             # 4. Create exit orders (if any)
             if trade.has_open_position:
-                self._check_trade_exit(trade, row, current_time)  # Place exit order if necessary
+                check_trade_exit(trade, row, current_time)  # Place exit order if necessary
 
             # 5. Process exit orders.
             order = trade.select_order(trade.exit_side, is_open=True)
             if order:
-                self._process_exit_order(order, trade, current_time, row, pair)
+                process_exit_order(order, trade, current_time, row, pair)
 
-        if exiting_dir and len(LocalTrade.bt_trades_open_pp[pair]) == 0:
+        if exiting_dir and len(trades_for_pair) == 0:
             return exiting_dir
         return None
 
@@ -1581,8 +1605,13 @@ class Backtesting:
         progress_increment = self.progress.increment
 
         current_time = start_date + timeframe_td
+        strategy = self.strategy
         while current_time <= end_date:
             check_abort()
+            # Precompute timestamp once per time-step (reused by _run_funding_fees, min_roi_reached)
+            current_time_ts = current_time.timestamp()
+            self._current_time_ts = current_time_ts
+            strategy._current_time_ts = current_time_ts
             if has_bot_loop:
                 self._w_bot_loop_start(current_time=current_time)
 

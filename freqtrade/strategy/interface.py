@@ -1382,6 +1382,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         low: float | None = None,
         high: float | None = None,
         force_stoploss: float = 0,
+        _current_profit: float | None = None,
     ) -> list[ExitCheckTuple]:
         """
         This function evaluates if one of the conditions required to trigger an exit order
@@ -1394,7 +1395,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         exits: list[ExitCheckTuple] = []
         current_rate = rate
 
-        current_profit = trade.calc_profit_ratio(current_rate)
+        current_profit = _current_profit if _current_profit is not None else trade.calc_profit_ratio(current_rate)
 
         current_profit_best = current_profit
         if low is not None or high is not None:
@@ -1667,7 +1668,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         # Check if time matches and current rate is above threshold
         open_ts = getattr(trade, '_open_date_ts', None) or trade.open_date_utc.timestamp()
-        trade_dur = int((current_time.timestamp() - open_ts) // 60)
+        current_time_ts = getattr(self, '_current_time_ts', None) or current_time.timestamp()
+        trade_dur = int((current_time_ts - open_ts) // 60)
         _, roi = self.min_roi_reached_entry(trade, trade_dur, current_time)
         if roi is None:
             return False
