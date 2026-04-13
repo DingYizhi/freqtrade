@@ -1,7 +1,6 @@
 import logging
 
 import polars as pl
-from pandas import DataFrame, read_feather, to_datetime
 from pyarrow import dataset
 
 from freqtrade.configuration import TimeRange
@@ -13,44 +12,41 @@ from .idatahandler import IDataHandler
 
 logger = logging.getLogger(__name__)
 
+# Schema for empty OHLCV polars DataFrames returned when no data is available.
+_EMPTY_OHLCV_SCHEMA = {
+    "date": pl.Datetime("us", "UTC"),
+    "open": pl.Float64,
+    "high": pl.Float64,
+    "low": pl.Float64,
+    "close": pl.Float64,
+    "volume": pl.Float64,
+}
+
 
 class FeatherDataHandler(IDataHandler):
     _columns = DEFAULT_DATAFRAME_COLUMNS
 
     def ohlcv_store(
-        self, pair: str, timeframe: str, data: DataFrame, candle_type: CandleType
+        self, pair: str, timeframe: str, data: pl.DataFrame, candle_type: CandleType
     ) -> None:
         """
-        Store data in json format "values".
-            format looks as follows:
-            [[<date>,<open>,<high>,<low>,<close>]]
+        Store data in feather format.
         :param pair: Pair - used to generate filename
         :param timeframe: Timeframe - used to generate filename
-        :param data: Dataframe containing OHLCV data
+        :param data: polars DataFrame containing OHLCV data
         :param candle_type: Any of the enum CandleType (must match trading mode!)
         :return: None
         """
         filename = self._pair_data_filename(self._datadir, pair, timeframe, candle_type)
         self.create_dir_if_needed(filename)
-
-        data.reset_index(drop=True).loc[:, self._columns].to_feather(
-            filename, compression_level=9, compression="lz4"
-        )
+        data.select(self._columns).write_ipc(filename, compression="lz4")
 
     def _ohlcv_load(
         self, pair: str, timeframe: str, timerange: TimeRange | None, candle_type: CandleType
-    ) -> DataFrame:
+    ) -> pl.DataFrame:
         """
         Internal method used to load data for one pair from disk.
-        Implements the loading and conversion to a Pandas dataframe.
-        Timerange trimming and dataframe validation happens outside of this method.
-        :param pair: Pair to load data
-        :param timeframe: Timeframe (e.g. "5m")
-        :param timerange: Limit data to be loaded to this timerange.
-                        Optionally implemented by subclasses to avoid loading
-                        all data where possible.
-        :param candle_type: Any of the enum CandleType (must match trading mode!)
-        :return: DataFrame with ohlcv data, or empty DataFrame
+        Returns a polars DataFrame.
         """
         filename = self._pair_data_filename(self._datadir, pair, timeframe, candle_type=candle_type)
         if not filename.exists():
@@ -59,7 +55,7 @@ class FeatherDataHandler(IDataHandler):
                 self._datadir, pair, timeframe, candle_type=candle_type, no_timeframe_modify=True
             )
             if not filename.exists():
-                return DataFrame(columns=self._columns)
+                return pl.DataFrame(schema=_EMPTY_OHLCV_SCHEMA)
         try:
             pairdata = pl.read_ipc(filename, memory_map=False)
             pairdata.columns = self._columns
@@ -70,57 +66,45 @@ class FeatherDataHandler(IDataHandler):
                 pl.col("close").cast(pl.Float64),
                 pl.col("volume").cast(pl.Float64),
             )
-            return pairdata.to_pandas()
+            return pairdata
         except Exception as e:
             logger.exception(
                 f"Error loading data from {filename}. Exception: {e}. Returning empty dataframe."
             )
-            return DataFrame(columns=self._columns)
+            return pl.DataFrame(schema=_EMPTY_OHLCV_SCHEMA)
 
     def ohlcv_append(
-        self, pair: str, timeframe: str, data: DataFrame, candle_type: CandleType
+        self, pair: str, timeframe: str, data: pl.DataFrame, candle_type: CandleType
     ) -> None:
         """
         Append data to existing data structures
-        :param pair: Pair
-        :param timeframe: Timeframe this ohlcv data is for
-        :param data: Data to append.
-        :param candle_type: Any of the enum CandleType (must match trading mode!)
         """
         raise NotImplementedError()
 
-    def _trades_store(self, pair: str, data: DataFrame, trading_mode: TradingMode) -> None:
+    def _trades_store(self, pair: str, data: pl.DataFrame, trading_mode: TradingMode) -> None:
         """
-        Store trades data (list of Dicts) to file
+        Store trades data to file
         :param pair: Pair - used for filename
-        :param data: Dataframe containing trades
-                     column sequence as in DEFAULT_TRADES_COLUMNS
+        :param data: polars DataFrame containing trades
         :param trading_mode: Trading mode to use (used to determine the filename)
         """
         filename = self._pair_trades_filename(self._datadir, pair, trading_mode)
         self.create_dir_if_needed(filename)
-        data.reset_index(drop=True).to_feather(filename, compression_level=9, compression="lz4")
+        data.write_ipc(filename, compression="lz4")
 
-    def trades_append(self, pair: str, data: DataFrame):
+    def trades_append(self, pair: str, data: pl.DataFrame):
         """
         Append data to existing files
-        :param pair: Pair - used for filename
-        :param data: Dataframe containing trades
-                     column sequence as in DEFAULT_TRADES_COLUMNS
         """
         raise NotImplementedError()
 
     def _build_arrow_time_filter(self, timerange: TimeRange | None):
         """
         Build Arrow predicate filter for timerange filtering.
-        Treats 0 as unbounded (no filter on that side).
-        :param timerange: TimeRange object with start/stop timestamps
-        :return: Arrow filter expression or None if fully unbounded
         """
         if not timerange:
             return None
 
-        # Treat 0 as unbounded
         start_set = bool(timerange.startts and timerange.startts > 0)
         stop_set = bool(timerange.stopts and timerange.stopts > 0)
 
@@ -142,41 +126,40 @@ class FeatherDataHandler(IDataHandler):
 
     def _trades_load(
         self, pair: str, trading_mode: TradingMode, timerange: TimeRange | None = None
-    ) -> DataFrame:
+    ) -> pl.DataFrame:
         """
-        Load a pair from file, either .json.gz or .json
+        Load trades from feather file as polars DataFrame.
         :param pair: Load trades for this pair
         :param trading_mode: Trading mode to use (used to determine the filename)
         :param timerange: Timerange to load trades for - filters data to this range if provided
-        :return: Dataframe containing trades
+        :return: polars DataFrame containing trades
         """
         filename = self._pair_trades_filename(self._datadir, pair, trading_mode)
         if not filename.exists():
-            return DataFrame(columns=DEFAULT_TRADES_COLUMNS)
+            return pl.DataFrame(schema={c: pl.Utf8 for c in DEFAULT_TRADES_COLUMNS})
 
-        # Use Arrow dataset with optional timerange filtering, fallback to read_feather
         try:
             dataset_reader = dataset.dataset(filename, format="feather")
             time_filter = self._build_arrow_time_filter(timerange)
 
             if time_filter is not None and timerange is not None:
-                tradesdata = dataset_reader.to_table(filter=time_filter).to_pandas()
+                table = dataset_reader.to_table(filter=time_filter)
                 start_desc = timerange.startts if timerange.startts > 0 else "unbounded"
                 stop_desc = timerange.stopts if timerange.stopts > 0 else "unbounded"
                 logger.debug(
-                    f"Loaded {len(tradesdata)} trades for {pair} "
+                    f"Loaded {len(table)} trades for {pair} "
                     f"(filtered start={start_desc}, stop={stop_desc})"
                 )
             else:
-                tradesdata = dataset_reader.to_table().to_pandas()
-                logger.debug(f"Loaded {len(tradesdata)} trades for {pair} (unfiltered)")
+                table = dataset_reader.to_table()
+                logger.debug(f"Loaded {len(table)} trades for {pair} (unfiltered)")
+
+            return pl.from_arrow(table)
 
         except (ImportError, AttributeError, ValueError) as e:
-            # Fallback: load entire file
+            # Fallback: load entire file via polars
             logger.warning(f"Unable to use Arrow filtering, loading entire trades file: {e}")
-            tradesdata = read_feather(filename)
-
-        return tradesdata
+            return pl.read_ipc(filename, memory_map=False)
 
     @classmethod
     def _get_file_extension(cls):

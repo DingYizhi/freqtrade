@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from pandas import DataFrame
+import polars as pl
 
 from freqtrade.configuration import sanitize_config
 from freqtrade.constants import LAST_BT_RESULT_FN
@@ -51,8 +51,8 @@ def store_backtest_results(
     stats: BacktestResultType,
     dtappendix: str,
     *,
-    market_change_data: DataFrame | None = None,
-    analysis_results: dict[str, dict[str, DataFrame]] | None = None,
+    market_change_data: pl.DataFrame | None = None,
+    analysis_results: dict[str, dict[str, pl.DataFrame]] | None = None,
     strategy_files: dict[str, str] | None = None,
 ) -> Path:
     """
@@ -117,9 +117,7 @@ def store_backtest_results(
         if market_change_data is not None:
             market_change_name = f"{base_filename.stem}_market_change.feather"
             market_change_buf = BytesIO()
-            market_change_data.reset_index().to_feather(
-                market_change_buf, compression_level=9, compression="lz4"
-            )
+            market_change_data.write_ipc(market_change_buf, compression="lz4")
             market_change_buf.seek(0)
             zipf.writestr(market_change_name, market_change_buf.getvalue())
 

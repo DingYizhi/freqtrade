@@ -10,8 +10,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Literal
 
-import numpy as np
-import pandas as pd
+import polars as pl
 
 from freqtrade.constants import LAST_BT_RESULT_FN
 from freqtrade.exceptions import ConfigurationError, OperationalException
@@ -120,9 +119,6 @@ def load_backtest_metadata(filename: Path | str) -> dict[str, Any]:
 def _normalize_filename(file_or_directory: Path | str, filename: Path | str | None) -> Path:
     """
     Normalize the filename by ensuring it is a Path object.
-    :param file_or_directory: The directory or file to normalize.
-    :param filename: The filename to normalize.
-    :return: A Path object representing the normalized filename.
     """
     if isinstance(file_or_directory, str):
         file_or_directory = Path(file_or_directory)
@@ -237,7 +233,6 @@ def delete_backtest_result(file_abs: Path):
     """
     Delete backtest result file and corresponding metadata file.
     """
-    # *.meta.json
     logger.info(f"Deleting backtest result file: {file_abs.name}")
 
     for file in file_abs.parent.glob(f"{file_abs.stem}*"):
@@ -260,17 +255,19 @@ def update_backtest_metadata(filename: Path, strategy: str, content: dict[str, A
     file_dump_json(get_backtest_metadata_filename(filename), metadata)
 
 
-def get_backtest_market_change(filename: Path, include_ts: bool = True) -> pd.DataFrame:
+def get_backtest_market_change(filename: Path, include_ts: bool = True) -> pl.DataFrame:
     """
     Read backtest market change file.
     """
     if filename.suffix == ".zip":
         data = load_file_from_zip(filename, f"{filename.stem}_market_change.feather")
-        df = pd.read_feather(BytesIO(data))
+        df = pl.read_ipc(BytesIO(data))
     else:
-        df = pd.read_feather(filename)
+        df = pl.read_ipc(filename)
     if include_ts:
-        df.loc[:, "__date_ts"] = df.loc[:, "date"].astype(np.int64) // 1000 // 1000
+        df = df.with_columns(
+            (pl.col("date").cast(pl.Int64) // 1000 // 1000).alias("__date_ts")
+        )
     return df
 
 
@@ -323,32 +320,33 @@ def find_existing_backtest_stats(
     return results
 
 
-def _load_backtest_data_df_compatibility(df: pd.DataFrame) -> pd.DataFrame:
+def _load_backtest_data_df_compatibility(df: pl.DataFrame) -> pl.DataFrame:
     """
     Compatibility support for older backtest data.
     """
-    df["open_date"] = pd.to_datetime(df["open_date"], utc=True)
-    df["close_date"] = pd.to_datetime(df["close_date"], utc=True)
+    df = df.with_columns(
+        pl.col("open_date").cast(pl.Datetime("ms", "UTC")),
+        pl.col("close_date").cast(pl.Datetime("ms", "UTC")),
+    )
     # Compatibility support for pre short Columns
     if "is_short" not in df.columns:
-        df["is_short"] = False
+        df = df.with_columns(pl.lit(False).alias("is_short"))
     if "leverage" not in df.columns:
-        df["leverage"] = 1.0
+        df = df.with_columns(pl.lit(1.0).alias("leverage"))
     if "enter_tag" not in df.columns:
-        df["enter_tag"] = df["buy_tag"]
-        df = df.drop(["buy_tag"], axis=1)
+        df = df.with_columns(pl.col("buy_tag").alias("enter_tag")).drop("buy_tag")
     if "max_stake_amount" not in df.columns:
-        df["max_stake_amount"] = df["stake_amount"]
+        df = df.with_columns(pl.col("stake_amount").alias("max_stake_amount"))
     if "orders" not in df.columns:
-        df["orders"] = None
+        df = df.with_columns(pl.lit(None).alias("orders"))
     if "funding_fees" not in df.columns:
-        df["funding_fees"] = 0.0
+        df = df.with_columns(pl.lit(0.0).alias("funding_fees"))
     return df
 
 
 def load_backtest_data(
     file_or_directory: Path | str, strategy: str | None = None, filename: Path | str | None = None
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Load backtest data file, returns a dataframe with the individual trades.
     :param file_or_directory: pathlib.Path object, or string pointing to the directory,
@@ -357,7 +355,7 @@ def load_backtest_data(
                      Can also serve as protection to load the correct result.
     :param filename: Optional filename to load from (if different from the main filename).
         Only valid when loading from a directory.
-    :return: a dataframe with the analysis results
+    :return: a polars dataframe with the analysis results
     :raise: ValueError if loading goes wrong.
     """
     data = load_backtest_stats(file_or_directory, filename)
@@ -382,17 +380,19 @@ def load_backtest_data(
             )
 
         data = data["strategy"][strategy]["trades"]
-        df = pd.DataFrame(data)
-        if not df.empty:
+        if data:
+            df = pl.DataFrame(data)
             df = _load_backtest_data_df_compatibility(df)
+        else:
+            df = pl.DataFrame(schema={c: pl.Utf8 for c in BT_DATA_COLUMNS})
 
     else:
         # old format - only with lists.
         raise OperationalException(
             "Backtest-results with only trades data are no longer supported."
         )
-    if not df.empty:
-        df = df.sort_values("open_date").reset_index(drop=True)
+    if not df.is_empty():
+        df = df.sort("open_date")
     return df
 
 
@@ -426,12 +426,6 @@ def load_backtest_analysis_data(
 ):
     """
     Load backtest analysis data either from a pickle file or from within a zip file
-    :param file_or_directory: pathlib.Path object, or string pointing to the directory,
-        or absolute/relative path to the backtest results file.
-    :param name: Name of the analysis data to load (signals, rejected, exited)
-    :param filename: Optional filename to load from (if different from the main filename).
-        Only valid when loading from a directory.
-    :return: Analysis data
     """
     import joblib
 
@@ -465,27 +459,39 @@ def load_backtest_analysis_data(
             return None
 
 
-def trade_list_to_dataframe(trades: list[Trade] | list[LocalTrade]) -> pd.DataFrame:
+def trade_list_to_dataframe(trades: list[Trade] | list[LocalTrade]) -> pl.DataFrame:
     """
-    Convert list of Trade objects to pandas Dataframe
+    Convert list of Trade objects to polars DataFrame
     :param trades: List of trade objects
-    :return: Dataframe with BT_DATA_COLUMNS
+    :return: polars DataFrame with BT_DATA_COLUMNS
     """
-    df = pd.DataFrame.from_records([t.to_json(True) for t in trades], columns=BT_DATA_COLUMNS)
+    if not trades:
+        return pl.DataFrame(schema={c: pl.Utf8 for c in BT_DATA_COLUMNS})
+
+    records = [t.to_json(True) for t in trades]
+    # Extract only BT_DATA_COLUMNS from each record
+    filtered = [{k: r.get(k) for k in BT_DATA_COLUMNS} for r in records]
+    df = pl.DataFrame(filtered)
+
     if len(df) > 0:
-        df["close_date"] = pd.to_datetime(df["close_timestamp"], unit="ms", utc=True)
-        df["open_date"] = pd.to_datetime(df["open_timestamp"], unit="ms", utc=True)
-        df["close_rate"] = df["close_rate"].astype("float64")
+        df = df.with_columns(
+            pl.from_epoch(pl.col("close_timestamp"), time_unit="ms")
+            .dt.replace_time_zone("UTC")
+            .alias("close_date"),
+            pl.from_epoch(pl.col("open_timestamp"), time_unit="ms")
+            .dt.replace_time_zone("UTC")
+            .alias("open_date"),
+            pl.col("close_rate").cast(pl.Float64),
+        )
     return df
 
 
-def load_trades_from_db(db_url: str, strategy: str | None = None) -> pd.DataFrame:
+def load_trades_from_db(db_url: str, strategy: str | None = None) -> pl.DataFrame:
     """
     Load trades from a DB (using dburl)
     :param db_url: Sqlite url (default format sqlite:///tradesv3.dry-run.sqlite)
     :param strategy: Strategy to load - mainly relevant for multi-strategy backtests
-                     Can also serve as protection to load the correct result.
-    :return: Dataframe containing Trades
+    :return: polars DataFrame containing Trades
     """
     init_db(db_url)
 
@@ -503,7 +509,7 @@ def load_trades(
     exportfilename: Path,
     no_trades: bool = False,
     strategy: str | None = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Based on configuration option 'trade_source':
     * loads data from DB (using `db_url`)
@@ -512,11 +518,10 @@ def load_trades(
     :param db_url: sqlalchemy formatted url to a database
     :param exportfilename: Json file generated by backtesting
     :param no_trades: Skip using trades, only return backtesting data columns
-    :return: DataFrame containing trades
+    :return: polars DataFrame containing trades
     """
     if no_trades:
-        df = pd.DataFrame(columns=BT_DATA_COLUMNS)
-        return df
+        return pl.DataFrame(schema={c: pl.Utf8 for c in BT_DATA_COLUMNS})
 
     if source == "DB":
         return load_trades_from_db(db_url)
@@ -525,19 +530,19 @@ def load_trades(
 
 
 def extract_trades_of_period(
-    dataframe: pd.DataFrame, trades: pd.DataFrame, date_index=False
-) -> pd.DataFrame:
+    dataframe: pl.DataFrame, trades: pl.DataFrame, date_index: bool = False
+) -> pl.DataFrame:
     """
     Compare trades and backtested pair DataFrames to get trades performed on backtested period
-    :return: the DataFrame of a trades of period
+    :return: the DataFrame of trades within the period
     """
     if date_index:
-        trades_start = dataframe.index[0]
-        trades_stop = dataframe.index[-1]
+        trades_start = dataframe["date"][0]
+        trades_stop = dataframe["date"][-1]
     else:
-        trades_start = dataframe.iloc[0]["date"]
-        trades_stop = dataframe.iloc[-1]["date"]
-    trades = trades.loc[
-        (trades["open_date"] >= trades_start) & (trades["close_date"] <= trades_stop)
-    ]
+        trades_start = dataframe["date"][0]
+        trades_stop = dataframe["date"][-1]
+    trades = trades.filter(
+        (pl.col("open_date") >= trades_start) & (pl.col("close_date") <= trades_stop)
+    )
     return trades

@@ -17,7 +17,6 @@ from freqtrade.strategy.parameters import (
     RealParameter,
 )
 from freqtrade.strategy.strategy_helper import (
-    merge_informative_pair,
     stoploss_from_absolute,
     stoploss_from_open,
 )
@@ -41,7 +40,6 @@ __all__ = [
     "timeframe_to_next_date",
     "timeframe_to_prev_date",
     # Strategy helper functions
-    "merge_informative_pair",
     "stoploss_from_absolute",
     "stoploss_from_open",
 ]

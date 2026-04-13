@@ -2,14 +2,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pandas import DataFrame
+import polars as pl
 
 from freqtrade.enums import CandleType
 from freqtrade.exceptions import OperationalException
-from freqtrade.strategy.strategy_helper import merge_informative_pair
 
 
-PopulateIndicators = Callable[[Any, DataFrame, dict], DataFrame]
+PopulateIndicators = Callable[[Any, pl.DataFrame, dict], pl.DataFrame]
 
 
 @dataclass
@@ -47,15 +46,6 @@ def informative(
     specified, defaults to:
     * {base}_{quote}_{column}_{timeframe} if asset is specified.
     * {column}_{timeframe} if asset is not specified.
-    Pair format supports these format variables:
-    * {base} - base currency in lower case, for example 'eth'.
-    * {BASE} - same as {base}, except in upper case.
-    * {quote} - quote currency in lower case, for example 'usdt'.
-    * {QUOTE} - same as {quote}, except in upper case.
-    Format string additionally supports this variables.
-    * {asset} - full name of the asset, for example 'BTC/USDT'.
-    * {column} - name of dataframe column.
-    * {timeframe} - timeframe of informative dataframe.
     :param ffill: ffill dataframe after merging informative pair.
     :param candle_type: '', mark, index, premiumIndex, or funding_rate
     """
@@ -97,11 +87,18 @@ def _format_pair_name(config, pair: str, market: dict[str, Any] | None = None) -
 
 def _create_and_merge_informative_pair(
     strategy,
-    dataframe: DataFrame,
+    dataframe: pl.DataFrame,
     metadata: dict,
     inf_data: InformativeData,
     populate_indicators_fn: PopulateIndicators,
 ):
+    """
+    Create and merge informative pair data using polars.
+    This is used by the @informative decorator in strategies.
+    """
+    from freqtrade.exchange import timeframe_to_minutes
+    from freqtrade.data.converter.converter import _seconds_to_polars_duration
+
     asset = inf_data.asset or ""
     timeframe = inf_data.timeframe
     timeframe1 = inf_data.timeframe
@@ -113,30 +110,23 @@ def _create_and_merge_informative_pair(
     config = strategy.config
 
     if asset:
-        # Insert stake currency if needed.
         market1 = strategy.dp.market(metadata["pair"])
         asset = _format_pair_name(config, asset, market1)
     else:
-        # Not specifying an asset will define informative dataframe for current pair.
         asset = metadata["pair"]
 
     market = strategy.dp.market(asset)
     if market is None:
         raise OperationalException(f"Market {asset} is not available.")
 
-    # Default format. This optimizes for the common case: informative pairs using same stake
-    # currency. When quote currency matches stake currency, column name will omit base currency.
-    # This allows easily reconfiguring strategy to use different base currency. In a rare case
-    # where it is desired to keep quote currency in column name at all times user should specify
-    # fmt='{base}_{quote}_{column}_{timeframe}' format or similar.
     if not fmt:
-        fmt = "{column}_{timeframe}"  # Informatives of current pair
+        fmt = "{column}_{timeframe}"
         if inf_data.asset:
-            fmt = "{base}_{quote}_" + fmt  # Informatives of other pairs
+            fmt = "{base}_{quote}_" + fmt
 
     inf_metadata = {"pair": asset, "timeframe": timeframe}
     inf_dataframe = strategy.dp.get_pair_dataframe(asset, timeframe1, candle_type)
-    if inf_dataframe.empty:
+    if inf_dataframe.is_empty():
         raise ValueError(
             f"Informative dataframe for ({asset}, {timeframe1}, {candle_type}) is empty. "
             "Can't populate informative indicators."
@@ -145,16 +135,19 @@ def _create_and_merge_informative_pair(
 
     formatter: Any = None
     if callable(fmt):
-        formatter = fmt  # A custom user-specified formatter function.
+        formatter = fmt
     else:
-        formatter = fmt.format  # A default string formatter.
+        formatter = fmt.format
 
     fmt_args = {
         **__get_pair_formats(market),
         "asset": asset,
         "timeframe": timeframe,
     }
-    inf_dataframe.rename(columns=lambda column: formatter(column=column, **fmt_args), inplace=True)
+
+    # Rename informative columns
+    rename_map = {col: formatter(column=col, **fmt_args) for col in inf_dataframe.columns}
+    inf_dataframe = inf_dataframe.rename(rename_map)
 
     date_column = formatter(column="date", **fmt_args)
     if date_column in dataframe.columns:
@@ -162,13 +155,42 @@ def _create_and_merge_informative_pair(
             f"Duplicate column name {date_column} exists in "
             f"dataframe! Ensure column names are unique!"
         )
-    dataframe = merge_informative_pair(
-        dataframe,
-        inf_dataframe,
-        strategy.timeframe,
-        timeframe1,
-        ffill=inf_data.ffill,
-        append_timeframe=False,
-        date_column=date_column,
-    )
+
+    # Polars merge: shift informative dates to avoid lookahead
+    minutes_inf = timeframe_to_minutes(timeframe1)
+    minutes = timeframe_to_minutes(strategy.timeframe)
+
+    if minutes == minutes_inf:
+        inf_dataframe = inf_dataframe.with_columns(
+            pl.col(date_column).alias("_date_merge")
+        )
+    elif minutes < minutes_inf:
+        if not inf_dataframe.is_empty():
+            shift_duration = f"{minutes_inf - minutes}m"
+            inf_dataframe = inf_dataframe.with_columns(
+                (pl.col(date_column) + pl.duration(minutes=minutes_inf - minutes)).alias("_date_merge")
+            )
+        else:
+            inf_dataframe = inf_dataframe.with_columns(
+                pl.col(date_column).alias("_date_merge")
+            )
+    else:
+        raise ValueError(
+            "Tried to merge a faster timeframe to a slower timeframe."
+            "This would create new rows, and can throw off your regular indicators."
+        )
+
+    # asof join on date
+    dataframe = dataframe.sort("date")
+    inf_dataframe = inf_dataframe.sort("_date_merge")
+
+    # Drop date_column from inf before join to avoid conflicts
+    join_cols = [c for c in inf_dataframe.columns if c != date_column]
+    dataframe = dataframe.join_asof(
+        inf_dataframe.select(join_cols),
+        left_on="date",
+        right_on="_date_merge",
+        strategy="backward",
+    ).drop("_date_merge")
+
     return dataframe

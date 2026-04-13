@@ -12,7 +12,7 @@ from typing import Any, Literal, TypeVar
 import ccxt
 from ccxt import TICK_SIZE
 from dateutil import parser
-from pandas import DataFrame
+import polars as pl
 
 from freqtrade.configuration import remove_exchange_credentials
 from freqtrade.constants import (
@@ -175,7 +175,7 @@ class Exchange:
         self._last_markets_refresh: int = 0
 
         # Holds candles
-        self._klines: dict[PairWithTimeframe, DataFrame] = {}
+        self._klines: dict[PairWithTimeframe, pl.DataFrame] = {}
 
         logger.info(f"Using CCXT {ccxt.__version__}")
 
@@ -445,11 +445,11 @@ class Exchange:
             )
         )
 
-    def klines(self, pair_interval: PairWithTimeframe, copy: bool = True) -> DataFrame:
+    def klines(self, pair_interval: PairWithTimeframe, copy: bool = True) -> pl.DataFrame:
         if pair_interval in self._klines:
-            return self._klines[pair_interval].copy() if copy else self._klines[pair_interval]
+            return self._klines[pair_interval].clone() if copy else self._klines[pair_interval]
         else:
-            return DataFrame()
+            return pl.DataFrame()
 
     def get_contract_size(self, pair: str) -> float | None:
         if self.trading_mode == TradingMode.FUTURES:
@@ -1059,8 +1059,8 @@ class Exchange:
 
     @staticmethod
     def combine_funding_and_mark(
-        funding_rates: DataFrame, mark_rates: DataFrame, futures_funding_rate: int | None = None
-    ) -> DataFrame:
+        funding_rates, mark_rates, futures_funding_rate: int | None = None
+    ) -> pl.DataFrame:
         """
         Combine funding-rates and mark-rates dataframes
         :param funding_rates: Dataframe containing Funding rates (Type FUNDING_RATE)
@@ -1069,42 +1069,72 @@ class Exchange:
         """
         relevant_cols = ["date", "open_mark", "open_fund"]
         if futures_funding_rate is None:
-            return mark_rates.merge(
-                funding_rates, on="date", how="inner", suffixes=["_mark", "_fund"]
-            )[relevant_cols]
+            combined = mark_rates.join(
+                funding_rates, on="date", how="inner", suffix="_fund"
+            )
+            # Rename mark columns
+            rename_map = {}
+            for col in mark_rates.columns:
+                if col != "date" and col + "_fund" not in combined.columns:
+                    if col + "_right" in combined.columns:
+                        pass  # _right suffix from join
+                    rename_map[col] = col + "_mark"
+            # Handle the join result: mark cols keep original names, fund cols get _fund suffix
+            result = combined.rename({
+                "open": "open_mark",
+                "open_fund": "open_fund",
+            } if "open" in combined.columns else {})
+            # Select relevant columns
+            if "open_mark" not in result.columns and "open" in result.columns:
+                result = result.rename({"open": "open_mark"})
+            if "open_fund" not in result.columns and "open_right" in result.columns:
+                result = result.rename({"open_right": "open_fund"})
+            return result.select(relevant_cols)
         else:
             if len(funding_rates) == 0:
-                # No funding rate candles - full fillup with fallback variable
-                mark_rates["open_fund"] = futures_funding_rate
-                return mark_rates.rename(
-                    columns={
-                        "open": "open_mark",
-                        "close": "close_mark",
-                        "high": "high_mark",
-                        "low": "low_mark",
-                        "volume": "volume_mark",
-                    }
-                )[relevant_cols]
-
-            else:
-                # Fill up missing funding_rate candles with fallback value
-                combined = mark_rates.merge(
-                    funding_rates, on="date", how="left", suffixes=["_mark", "_fund"]
+                mark_rates = mark_rates.rename({
+                    "open": "open_mark",
+                })
+                mark_rates = mark_rates.with_columns(
+                    pl.lit(futures_funding_rate).cast(pl.Float64).alias("open_fund")
                 )
-                # Fill only leading missing funding rates so gaps stay untouched
-                first_valid_idx = combined["open_fund"].first_valid_index()
-                if first_valid_idx is None:
-                    combined["open_fund"] = futures_funding_rate
-                else:
-                    is_leading_na = (combined.index <= first_valid_idx) & combined[
-                        "open_fund"
-                    ].isna()
-                    combined.loc[is_leading_na, "open_fund"] = futures_funding_rate
-                return combined[relevant_cols].dropna()
+                return mark_rates.select(relevant_cols)
+            else:
+                combined = mark_rates.join(
+                    funding_rates, on="date", how="left", suffix="_fund"
+                )
+                # Rename columns
+                if "open" in combined.columns:
+                    combined = combined.rename({"open": "open_mark"})
+                if "open_fund" not in combined.columns and "open_right" in combined.columns:
+                    combined = combined.rename({"open_right": "open_fund"})
+
+                # Fill only leading missing funding rates
+                fund_col = combined["open_fund"]
+                first_valid = None
+                for i, v in enumerate(fund_col.to_list()):
+                    if v is not None:
+                        first_valid = i
+                        break
+
+                if first_valid is None:
+                    combined = combined.with_columns(
+                        pl.lit(futures_funding_rate).cast(pl.Float64).alias("open_fund")
+                    )
+                elif first_valid > 0:
+                    # Fill leading nulls only
+                    mask = pl.Series([i < first_valid for i in range(len(combined))])
+                    combined = combined.with_columns(
+                        pl.when(mask & pl.col("open_fund").is_null())
+                        .then(pl.lit(futures_funding_rate).cast(pl.Float64))
+                        .otherwise(pl.col("open_fund"))
+                        .alias("open_fund")
+                    )
+                return combined.select(relevant_cols).drop_nulls()
 
     def calculate_funding_fees(
         self,
-        df: DataFrame,
+        df: pl.DataFrame,
         amount: float,
         is_short: bool,
         open_date: datetime,
@@ -1121,9 +1151,9 @@ class Exchange:
         """
         fees: float = 0
 
-        if not df.empty:
-            df1 = df[(df["date"] >= open_date) & (df["date"] <= close_date)]
-            fees = sum(df1["open_fund"] * df1["open_mark"] * amount)
+        if not df.is_empty():
+            df1 = df.filter((pl.col("date") >= open_date) & (pl.col("date") <= close_date))
+            fees = (df1["open_fund"] * df1["open_mark"] * amount).sum()
         if isnan(fees):
             fees = 0.0
         # Negate fees for longs as funding_fees expects it this way based on live endpoints.

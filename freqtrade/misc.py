@@ -5,15 +5,11 @@ Various tool function for Freqtrade and scripts
 import gzip
 import logging
 from collections.abc import Iterator, Mapping
-from io import StringIO
 from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import urlparse
 
-import pandas as pd
 import rapidjson
-
-from freqtrade.enums import SignalTagType, SignalType
 
 
 logger = logging.getLogger(__name__)
@@ -208,57 +204,3 @@ def parse_db_uri_for_logging(uri: str):
     return parsed_db_uri.geturl().replace(f":{pwd}@", ":*****@")
 
 
-def dataframe_to_json(dataframe: pd.DataFrame) -> str:
-    """
-    Serialize a DataFrame for transmission over the wire using JSON
-    :param dataframe: A pandas DataFrame
-    :returns: A JSON string of the pandas DataFrame
-    """
-    return dataframe.to_json(orient="split")
-
-
-def json_to_dataframe(data: str) -> pd.DataFrame:
-    """
-    Deserialize JSON into a DataFrame
-    :param data: A JSON string
-    :returns: A pandas DataFrame from the JSON string
-    """
-    dataframe = pd.read_json(StringIO(data), orient="split")
-    if "date" in dataframe.columns:
-        dataframe["date"] = pd.to_datetime(dataframe["date"], unit="ms", utc=True)
-
-    return dataframe
-
-
-def remove_entry_exit_signals(dataframe: pd.DataFrame):
-    """
-    Remove Entry and Exit signals from a DataFrame
-
-    :param dataframe: The DataFrame to remove signals from
-    """
-    dataframe[SignalType.ENTER_LONG] = 0
-    dataframe[SignalType.EXIT_LONG] = 0
-    dataframe[SignalType.ENTER_SHORT] = 0
-    dataframe[SignalType.EXIT_SHORT] = 0
-    dataframe[SignalTagType.ENTER_TAG] = None
-    dataframe[SignalTagType.EXIT_TAG] = None
-
-    return dataframe
-
-
-def append_candles_to_dataframe(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-    """
-    Append the `right` dataframe to the `left` dataframe
-
-    :param left: The full dataframe you want appended to
-    :param right: The new dataframe containing the data you want appended
-    :returns: The dataframe with the right data in it
-    """
-    if left.iloc[-1]["date"] != right.iloc[-1]["date"]:
-        left = pd.concat([left, right])
-
-    # Only keep the last 1500 candles in memory
-    left = left[-1500:] if len(left) > 1500 else left
-    left.reset_index(drop=True, inplace=True)
-
-    return left

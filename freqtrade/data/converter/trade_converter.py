@@ -5,8 +5,7 @@ Functions to convert data from one format to another
 import logging
 from pathlib import Path
 
-import pandas as pd
-from pandas import DataFrame, to_datetime
+import polars as pl
 
 from freqtrade.configuration import TimeRange
 from freqtrade.constants import (
@@ -23,14 +22,13 @@ from freqtrade.exceptions import OperationalException
 logger = logging.getLogger(__name__)
 
 
-def trades_df_remove_duplicates(trades: pd.DataFrame) -> pd.DataFrame:
+def trades_df_remove_duplicates(trades: pl.DataFrame) -> pl.DataFrame:
     """
     Removes duplicates from the trades DataFrame.
-    Uses pandas.DataFrame.drop_duplicates to remove duplicates based on the 'timestamp' column.
     :param trades: DataFrame with the columns constants.DEFAULT_TRADES_COLUMNS
-    :return: DataFrame with duplicates removed based on the 'timestamp' column
+    :return: DataFrame with duplicates removed based on the 'timestamp' and 'id' columns
     """
-    return trades.drop_duplicates(subset=["timestamp", "id"])
+    return trades.unique(subset=["timestamp", "id"], keep="first", maintain_order=True)
 
 
 def trades_dict_to_list(trades: list[dict]) -> TradeList:
@@ -42,24 +40,27 @@ def trades_dict_to_list(trades: list[dict]) -> TradeList:
     return [[t[col] for col in DEFAULT_TRADES_COLUMNS] for t in trades]
 
 
-def trades_convert_types(trades: DataFrame) -> DataFrame:
+def trades_convert_types(trades: pl.DataFrame) -> pl.DataFrame:
     """
     Convert Trades dtypes and add 'date' column
     """
-    trades = trades.astype(TRADES_DTYPES)
-    trades["date"] = to_datetime(trades["timestamp"], unit="ms", utc=True)
+    trades = trades.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="ms")
+        .dt.replace_time_zone("UTC")
+        .alias("date")
+    )
     return trades
 
 
-def trades_list_to_df(trades: TradeList, convert: bool = True):
+def trades_list_to_df(trades: TradeList, convert: bool = True) -> pl.DataFrame:
     """
     convert trades list to dataframe
     :param trades: List of Lists with constants.DEFAULT_TRADES_COLUMNS as columns
     """
     if not trades:
-        df = DataFrame(columns=DEFAULT_TRADES_COLUMNS)
+        df = pl.DataFrame(schema={c: pl.Utf8 for c in DEFAULT_TRADES_COLUMNS})
     else:
-        df = DataFrame(trades, columns=DEFAULT_TRADES_COLUMNS)
+        df = pl.DataFrame(trades, schema=DEFAULT_TRADES_COLUMNS, orient="row")
 
     if convert:
         df = trades_convert_types(df)
@@ -67,26 +68,31 @@ def trades_list_to_df(trades: TradeList, convert: bool = True):
     return df
 
 
-def trades_to_ohlcv(trades: DataFrame, timeframe: str) -> DataFrame:
+def trades_to_ohlcv(trades: pl.DataFrame, timeframe: str) -> pl.DataFrame:
     """
     Converts trades list to OHLCV list
-    :param trades: List of trades, as returned by ccxt.fetch_trades.
+    :param trades: polars DataFrame of trades
     :param timeframe: Timeframe to resample data to
-    :return: OHLCV Dataframe.
+    :return: OHLCV polars DataFrame
     :raises: ValueError if no trades are provided
     """
-    from freqtrade.exchange import timeframe_to_resample_freq
+    from freqtrade.exchange import timeframe_to_seconds
+    from freqtrade.data.converter.converter import _seconds_to_polars_duration
 
-    if trades.empty:
+    if trades.is_empty():
         raise ValueError("Trade-list empty.")
-    df = trades.set_index("date", drop=True)
-    resample_interval = timeframe_to_resample_freq(timeframe)
-    df_new = df["price"].resample(resample_interval).ohlc()
-    df_new["volume"] = df["amount"].resample(resample_interval).sum()
-    df_new["date"] = df_new.index
-    # Drop 0 volume rows
-    df_new = df_new.dropna()
-    return df_new.loc[:, DEFAULT_DATAFRAME_COLUMNS]
+
+    every = _seconds_to_polars_duration(timeframe_to_seconds(timeframe))
+    df = trades.sort("date").group_by_dynamic("date", every=every).agg(
+        pl.col("price").first().alias("open"),
+        pl.col("price").max().alias("high"),
+        pl.col("price").min().alias("low"),
+        pl.col("price").last().alias("close"),
+        pl.col("amount").sum().alias("volume"),
+    )
+    # Drop rows with nulls (equivalent to dropna)
+    df = df.drop_nulls()
+    return df.select(DEFAULT_DATAFRAME_COLUMNS)
 
 
 def convert_trades_to_ohlcv(

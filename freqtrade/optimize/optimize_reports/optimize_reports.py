@@ -3,8 +3,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-import numpy as np
-from pandas import DataFrame, Series, concat, to_datetime
+import polars as pl
 
 from freqtrade.constants import BACKTEST_BREAKDOWNS, DATETIME_PRINT_FORMAT
 from freqtrade.data.metrics import (
@@ -30,51 +29,54 @@ logger = logging.getLogger(__name__)
 
 
 def generate_trade_signal_candles(
-    preprocessed_df: dict[str, DataFrame], bt_results: BacktestContentType, date_col: str
-) -> dict[str, DataFrame]:
+    preprocessed_df: dict[str, pl.DataFrame], bt_results: BacktestContentType, date_col: str
+) -> dict[str, pl.DataFrame]:
     signal_candles_only = {}
     for pair in preprocessed_df.keys():
-        signal_candles_only_df = DataFrame()
-
         pairdf = preprocessed_df[pair]
         resdf = bt_results["results"]
-        pairresults = resdf.loc[(resdf["pair"] == pair)]
+        pairresults = resdf.filter(pl.col("pair") == pair)
 
-        if pairdf.shape[0] > 0:
-            for t, v in pairresults.iterrows():
-                allinds = pairdf.loc[(pairdf["date"] < v[date_col])]
-                signal_inds = allinds.iloc[[-1]]
-                signal_candles_only_df = concat(
-                    [signal_candles_only_df.infer_objects(), signal_inds.infer_objects()]
-                )
+        if pairdf.height > 0:
+            frames = []
+            for row in pairresults.iter_rows(named=True):
+                allinds = pairdf.filter(pl.col("date") < row[date_col])
+                if allinds.height > 0:
+                    frames.append(allinds.tail(1))
 
-            signal_candles_only[pair] = signal_candles_only_df
+            if frames:
+                signal_candles_only[pair] = pl.concat(frames)
+            else:
+                signal_candles_only[pair] = pl.DataFrame(schema=pairdf.schema)
     return signal_candles_only
 
 
 def generate_rejected_signals(
-    preprocessed_df: dict[str, DataFrame], rejected_dict: dict[str, DataFrame]
-) -> dict[str, DataFrame]:
+    preprocessed_df: dict[str, pl.DataFrame], rejected_dict: dict[str, list]
+) -> dict[str, pl.DataFrame]:
     rejected_candles_only = {}
     for pair, signals in rejected_dict.items():
-        rejected_signals_only_df = DataFrame()
         pairdf = preprocessed_df[pair]
 
+        frames = []
         for t in signals:
-            data_df_row = pairdf.loc[(pairdf["date"] == t[0])].copy()
-            data_df_row["pair"] = pair
-            data_df_row["enter_tag"] = t[1]
+            data_df_row = pairdf.filter(pl.col("date") == t[0])
+            if data_df_row.height > 0:
+                data_df_row = data_df_row.with_columns(
+                    pl.lit(pair).alias("pair"),
+                    pl.lit(t[1]).alias("enter_tag"),
+                )
+                frames.append(data_df_row)
 
-            rejected_signals_only_df = concat(
-                [rejected_signals_only_df.infer_objects(), data_df_row.infer_objects()]
-            )
-
-        rejected_candles_only[pair] = rejected_signals_only_df
+        if frames:
+            rejected_candles_only[pair] = pl.concat(frames)
+        else:
+            rejected_candles_only[pair] = pl.DataFrame()
     return rejected_candles_only
 
 
 def _generate_result_line(
-    result: DataFrame,
+    result: pl.DataFrame,
     min_date: datetime,
     max_date: datetime,
     starting_balance: float,
@@ -83,48 +85,42 @@ def _generate_result_line(
     """
     Generate one result dict, with "first_column" as key.
     """
-    # (end-capital - starting capital) / starting capital
-    profit_total = result["profit_abs"].sum() / starting_balance
+    profit_abs_sum = result["profit_abs"].sum()
+    profit_total = profit_abs_sum / starting_balance
     backtest_days = (max_date - min_date).days or 1
-    final_balance = starting_balance + result["profit_abs"].sum()
+    final_balance = starting_balance + profit_abs_sum
     expectancy, expectancy_ratio = calculate_expectancy(result)
-    winning_profit = result.loc[result["profit_abs"] > 0, "profit_abs"].sum()
-    losing_profit = result.loc[result["profit_abs"] < 0, "profit_abs"].sum()
+    winning_profit = result.filter(pl.col("profit_abs") > 0)["profit_abs"].sum()
+    losing_profit = result.filter(pl.col("profit_abs") < 0)["profit_abs"].sum()
     profit_factor = winning_profit / abs(losing_profit) if losing_profit else 0.0
 
     try:
         drawdown = calculate_max_drawdown(
             result, value_col="profit_abs", starting_balance=starting_balance
         )
-
     except ValueError:
         drawdown = None
 
+    n = len(result)
     return {
         "key": first_column,
-        "trades": len(result),
-        "profit_mean": result["profit_ratio"].mean() if len(result) > 0 else 0.0,
+        "trades": n,
+        "profit_mean": result["profit_ratio"].mean() if n > 0 else 0.0,
         "profit_mean_pct": (
-            round(result["profit_ratio"].mean() * 100.0, 2) if len(result) > 0 else 0.0
+            round(result["profit_ratio"].mean() * 100.0, 2) if n > 0 else 0.0
         ),
-        "profit_total_abs": result["profit_abs"].sum(),
+        "profit_total_abs": profit_abs_sum,
         "profit_total": profit_total,
         "profit_total_pct": round(profit_total * 100.0, 2),
         "duration_avg": (
             str(timedelta(minutes=round(result["trade_duration"].mean())))
-            if not result.empty
+            if n > 0
             else "0:00"
         ),
-        # 'duration_max': str(timedelta(
-        #                     minutes=round(result['trade_duration'].max()))
-        #                     ) if not result.empty else '0:00',
-        # 'duration_min': str(timedelta(
-        #                     minutes=round(result['trade_duration'].min()))
-        #                     ) if not result.empty else '0:00',
-        "wins": len(result[result["profit_abs"] > 0]),
-        "draws": len(result[result["profit_abs"] == 0]),
-        "losses": len(result[result["profit_abs"] < 0]),
-        "winrate": len(result[result["profit_abs"] > 0]) / len(result) if len(result) else 0.0,
+        "wins": result.filter(pl.col("profit_abs") > 0).height,
+        "draws": result.filter(pl.col("profit_abs") == 0).height,
+        "losses": result.filter(pl.col("profit_abs") < 0).height,
+        "winrate": result.filter(pl.col("profit_abs") > 0).height / n if n else 0.0,
         "cagr": calculate_cagr(backtest_days, starting_balance, final_balance),
         "expectancy": expectancy,
         "expectancy_ratio": expectancy_ratio,
@@ -139,46 +135,31 @@ def _generate_result_line(
 
 
 def calculate_trade_volume(trades_dict: list[dict[str, Any]]) -> float:
-    # Aggregate the total volume traded from orders.cost.
-    # Orders is a nested dictionary within the trades list.
-
     return sum(sum(order["cost"] for order in trade.get("orders", [])) for trade in trades_dict)
 
 
-def generate_pair_metrics(  #
+def generate_pair_metrics(
     pairlist: list[str],
     stake_currency: str,
     starting_balance: float,
-    results: DataFrame,
+    results: pl.DataFrame,
     min_date: datetime,
     max_date: datetime,
     skip_nan: bool = False,
 ) -> list[dict]:
-    """
-    Generates and returns a list  for the given backtest data and the results dataframe
-    :param pairlist: Pairlist used
-    :param stake_currency: stake-currency - used to correctly name headers
-    :param starting_balance: Starting balance
-    :param results: Dataframe containing the backtest results
-    :param skip_nan: Print "left open" open trades
-    :return: List of Dicts containing the metrics per pair
-    """
-
     tabular_data = []
 
     for pair in pairlist:
-        result = results[results["pair"] == pair]
-        if skip_nan and result["profit_abs"].isnull().all():
+        result = results.filter(pl.col("pair") == pair)
+        if skip_nan and result["profit_abs"].is_null().all():
             continue
 
         tabular_data.append(
             _generate_result_line(result, min_date, max_date, starting_balance, pair)
         )
 
-    # Sort by total profit %:
     tabular_data = sorted(tabular_data, key=lambda k: k["profit_total_abs"], reverse=True)
 
-    # Append Total
     tabular_data.append(
         _generate_result_line(results, min_date, max_date, starting_balance, "TOTAL")
     )
@@ -189,36 +170,26 @@ def generate_pair_metrics(  #
 def generate_tag_metrics(
     tag_type: Literal["enter_tag", "exit_reason"] | list[Literal["enter_tag", "exit_reason"]],
     starting_balance: float,
-    results: DataFrame,
+    results: pl.DataFrame,
     min_date: datetime,
     max_date: datetime,
     skip_nan: bool = False,
 ) -> list[dict]:
-    """
-    Generates and returns a list of metrics for the given tag trades and the results dataframe
-    :param starting_balance: Starting balance
-    :param results: Dataframe containing the backtest results
-    :param skip_nan: Print "left open" open trades
-    :return: List of Dicts containing the metrics per pair
-    """
-
     tabular_data = []
 
-    if all(
-        tag in results.columns for tag in (tag_type if isinstance(tag_type, list) else [tag_type])
-    ):
-        for tags, group in results.groupby(tag_type):
-            if skip_nan and group["profit_abs"].isnull().all():
+    tag_cols = tag_type if isinstance(tag_type, list) else [tag_type]
+    if all(tag in results.columns for tag in tag_cols):
+        for group_key, group in results.group_by(tag_cols, maintain_order=True):
+            if skip_nan and group["profit_abs"].is_null().all():
                 continue
-
+            # group_key is a tuple; for single tag, use scalar
+            tags = group_key[0] if len(tag_cols) == 1 else list(group_key)
             tabular_data.append(
                 _generate_result_line(group, min_date, max_date, starting_balance, tags)
             )
 
-        # Sort by total profit %:
         tabular_data = sorted(tabular_data, key=lambda k: k["profit_total_abs"], reverse=True)
 
-        # Append Total
         tabular_data.append(
             _generate_result_line(results, min_date, max_date, starting_balance, "TOTAL")
         )
@@ -228,16 +199,9 @@ def generate_tag_metrics(
 
 
 def generate_strategy_comparison(bt_stats: dict) -> list[dict]:
-    """
-    Generate summary per strategy
-    :param bt_stats: Dict of <Strategyname: DataFrame> containing results for all strategies
-    :return: List of Dicts containing the metrics per Strategy
-    """
-
     tabular_data = []
     for strategy, result in bt_stats.items():
         tabular_data.append(deepcopy(result["results_per_pair"][-1]))
-        # Update "key" to strategy (results_per_pair has it as "Total").
         tabular_data[-1]["key"] = strategy
         tabular_data[-1]["max_drawdown_account"] = result["max_drawdown_account"]
         tabular_data[-1]["max_drawdown_abs"] = fmt_coin(
@@ -250,26 +214,24 @@ def _get_resample_from_period(period: str) -> str:
     if period == "day":
         return "1d"
     if period == "week":
-        # Weekly defaulting to Monday.
-        return "1W-MON"
+        return "1w"
     if period == "month":
-        return "1ME"
+        return "1mo"
     if period == "year":
-        return "1YE"
+        return "1y"
     if period == "weekday":
-        # Required to pass the test
         return "weekday"
     raise ValueError(f"Period {period} is not supported.")
 
 
-def _calculate_stats_for_period(data: DataFrame) -> dict[str, Any]:
-    profit_abs = data["profit_abs"].sum().round(10)
-    wins = sum(data["profit_abs"] > 0)
-    draws = sum(data["profit_abs"] == 0)
-    losses = sum(data["profit_abs"] < 0)
+def _calculate_stats_for_period(data: pl.DataFrame) -> dict[str, Any]:
+    profit_abs = round(data["profit_abs"].sum(), 10)
+    wins = data.filter(pl.col("profit_abs") > 0).height
+    draws = data.filter(pl.col("profit_abs") == 0).height
+    losses = data.filter(pl.col("profit_abs") < 0).height
     trades = wins + draws + losses
-    winning_profit = data.loc[data["profit_abs"] > 0, "profit_abs"].sum()
-    losing_profit = data.loc[data["profit_abs"] < 0, "profit_abs"].sum()
+    winning_profit = data.filter(pl.col("profit_abs") > 0)["profit_abs"].sum()
+    losing_profit = data.filter(pl.col("profit_abs") < 0)["profit_abs"].sum()
     profit_factor = winning_profit / abs(losing_profit) if losing_profit else 0.0
 
     return {
@@ -283,35 +245,48 @@ def _calculate_stats_for_period(data: DataFrame) -> dict[str, Any]:
 
 
 def generate_periodic_breakdown_stats(
-    trade_list: list | DataFrame, period: str
+    trade_list: list | pl.DataFrame, period: str
 ) -> list[dict[str, Any]]:
-    results = trade_list if not isinstance(trade_list, list) else DataFrame.from_records(trade_list)
+    results = trade_list if isinstance(trade_list, pl.DataFrame) else pl.DataFrame(trade_list)
     if len(results) == 0:
         return []
 
-    results["close_date"] = to_datetime(results["close_date"], utc=True)
+    # Ensure close_date is datetime
+    if results["close_date"].dtype == pl.Utf8:
+        results = results.with_columns(
+            pl.col("close_date").str.to_datetime(time_zone="UTC")
+        )
+    elif results["close_date"].dtype == pl.Int64:
+        results = results.with_columns(
+            pl.from_epoch(pl.col("close_date"), time_unit="ms").dt.replace_time_zone("UTC")
+        )
 
     if period == "weekday":
         day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        results["weekday"] = results["close_date"].dt.dayofweek
+        results = results.with_columns(
+            pl.col("close_date").dt.weekday().alias("weekday")
+        )
 
         stats = []
         for day_num in range(7):
-            day_data = results[results["weekday"] == day_num]
+            # polars weekday: Monday=1..Sunday=7
+            day_data = results.filter(pl.col("weekday") == day_num + 1)
             if len(day_data) > 0:
                 period_stats = _calculate_stats_for_period(day_data)
                 stats.append({"date": day_names[day_num], "date_ts": day_num, **period_stats})
     else:
         resample_period = _get_resample_from_period(period)
-        resampled = results.resample(resample_period, on="close_date")
 
+        results = results.sort("close_date")
+        grouped = results.group_by_dynamic("close_date", every=resample_period)
         stats = []
-        for name, period_data in resampled:
+        for group_key, period_data in grouped:
             period_stats = _calculate_stats_for_period(period_data)
+            dt = group_key[0]
             stats.append(
                 {
-                    "date": name.strftime("%d/%m/%Y"),
-                    "date_ts": int(name.to_pydatetime().timestamp() * 1000),
+                    "date": dt.strftime("%d/%m/%Y"),
+                    "date_ts": int(dt.timestamp() * 1000),
                     **period_stats,
                 }
             )
@@ -319,32 +294,50 @@ def generate_periodic_breakdown_stats(
     return stats
 
 
-def generate_all_periodic_breakdown_stats(trade_list: list) -> dict[str, list]:
+def generate_all_periodic_breakdown_stats(trade_list: list | pl.DataFrame) -> dict[str, list]:
     result = {}
     for period in BACKTEST_BREAKDOWNS:
         result[period] = generate_periodic_breakdown_stats(trade_list, period)
     return result
 
 
-def calc_streak(dataframe: DataFrame) -> tuple[int, int]:
+def calc_streak(dataframe: pl.DataFrame) -> tuple[int, int]:
     """
     Calculate consecutive win and loss streaks
-    :param dataframe: Dataframe containing the trades dataframe, with profit_ratio column
-    :return: Tuple containing consecutive wins and losses
     """
+    results = dataframe.select(
+        pl.when(pl.col("profit_ratio") > 0)
+        .then(pl.lit("win"))
+        .otherwise(pl.lit("loss"))
+        .alias("result")
+    )
 
-    df = Series(np.where(dataframe["profit_ratio"] > 0, "win", "loss")).to_frame("result")
-    df["streaks"] = df["result"].ne(df["result"].shift()).cumsum().rename("streaks")
-    df["counter"] = df["streaks"].groupby(df["streaks"]).cumcount() + 1
-    res = df.groupby(df["result"]).max()
-    #
-    cons_wins = int(res.loc["win", "counter"]) if "win" in res.index else 0
-    cons_losses = int(res.loc["loss", "counter"]) if "loss" in res.index else 0
+    result_col = results["result"]
+    # Build streak groups: increment when result changes from previous
+    shifted = result_col.shift(1)
+    group_ids = (result_col != shifted).cum_sum()
+
+    streak_df = pl.DataFrame({
+        "result": result_col,
+        "group": group_ids,
+    })
+
+    # Count consecutive within each group, then get max per result type
+    streak_counts = (
+        streak_df.group_by("group", "result")
+        .agg(pl.len().alias("count"))
+    )
+
+    wins_max = streak_counts.filter(pl.col("result") == "win")
+    losses_max = streak_counts.filter(pl.col("result") == "loss")
+
+    cons_wins = int(wins_max["count"].max()) if wins_max.height > 0 else 0
+    cons_losses = int(losses_max["count"].max()) if losses_max.height > 0 else 0
+
     return cons_wins, cons_losses
 
 
-def generate_trading_stats(results: DataFrame) -> dict[str, Any]:
-    """Generate overall trade statistics"""
+def generate_trading_stats(results: pl.DataFrame) -> dict[str, Any]:
     if len(results) == 0:
         return {
             "wins": 0,
@@ -358,54 +351,52 @@ def generate_trading_stats(results: DataFrame) -> dict[str, Any]:
             "max_consecutive_losses": 0,
         }
 
-    winning_trades = results.loc[results["profit_ratio"] > 0]
-    winning_duration = winning_trades["trade_duration"]
-    draw_trades = results.loc[results["profit_ratio"] == 0]
-    losing_trades = results.loc[results["profit_ratio"] < 0]
-    losing_duration = losing_trades["trade_duration"]
+    winning_trades = results.filter(pl.col("profit_ratio") > 0)
+    draw_trades = results.filter(pl.col("profit_ratio") == 0)
+    losing_trades = results.filter(pl.col("profit_ratio") < 0)
 
     holding_avg = (
         timedelta(minutes=round(results["trade_duration"].mean()))
-        if not results.empty
+        if not results.is_empty()
         else timedelta()
     )
     winner_holding_min = (
-        timedelta(minutes=round(winning_duration.min()))
-        if not winning_duration.empty
+        timedelta(minutes=round(winning_trades["trade_duration"].min()))
+        if not winning_trades.is_empty()
         else timedelta()
     )
     winner_holding_max = (
-        timedelta(minutes=round(winning_duration.max()))
-        if not winning_duration.empty
+        timedelta(minutes=round(winning_trades["trade_duration"].max()))
+        if not winning_trades.is_empty()
         else timedelta()
     )
     winner_holding_avg = (
-        timedelta(minutes=round(winning_duration.mean()))
-        if not winning_duration.empty
+        timedelta(minutes=round(winning_trades["trade_duration"].mean()))
+        if not winning_trades.is_empty()
         else timedelta()
     )
     loser_holding_min = (
-        timedelta(minutes=round(losing_duration.min()))
-        if not losing_duration.empty
+        timedelta(minutes=round(losing_trades["trade_duration"].min()))
+        if not losing_trades.is_empty()
         else timedelta()
     )
     loser_holding_max = (
-        timedelta(minutes=round(losing_duration.max()))
-        if not losing_duration.empty
+        timedelta(minutes=round(losing_trades["trade_duration"].max()))
+        if not losing_trades.is_empty()
         else timedelta()
     )
     loser_holding_avg = (
-        timedelta(minutes=round(losing_duration.mean()))
-        if not losing_duration.empty
+        timedelta(minutes=round(losing_trades["trade_duration"].mean()))
+        if not losing_trades.is_empty()
         else timedelta()
     )
     winstreak, loss_streak = calc_streak(results)
 
     return {
-        "wins": len(winning_trades),
-        "losses": len(losing_trades),
-        "draws": len(draw_trades),
-        "winrate": len(winning_trades) / len(results) if len(results) else 0.0,
+        "wins": winning_trades.height,
+        "losses": losing_trades.height,
+        "draws": draw_trades.height,
+        "winrate": winning_trades.height / results.height if results.height else 0.0,
         "holding_avg": holding_avg,
         "holding_avg_s": holding_avg.total_seconds(),
         "winner_holding_min": format_duration(winner_holding_min),
@@ -425,8 +416,7 @@ def generate_trading_stats(results: DataFrame) -> dict[str, Any]:
     }
 
 
-def generate_daily_stats(results: DataFrame) -> dict[str, Any]:
-    """Generate daily statistics"""
+def generate_daily_stats(results: pl.DataFrame) -> dict[str, Any]:
     if len(results) == 0:
         return {
             "backtest_best_day": 0,
@@ -438,16 +428,25 @@ def generate_daily_stats(results: DataFrame) -> dict[str, Any]:
             "losing_days": 0,
             "daily_profit_list": [],
         }
-    daily_profit_rel = results.resample("1d", on="close_date")["profit_ratio"].sum()
-    daily_profit = results.resample("1d", on="close_date")["profit_abs"].sum().round(10)
-    worst_rel = min(daily_profit_rel)
-    best_rel = max(daily_profit_rel)
-    worst = min(daily_profit)
-    best = max(daily_profit)
-    winning_days = sum(daily_profit > 0)
-    draw_days = sum(daily_profit == 0)
-    losing_days = sum(daily_profit < 0)
-    daily_profit_list = [(str(idx.date()), val) for idx, val in daily_profit.items()]
+    daily = (
+        results.sort("close_date")
+        .group_by_dynamic("close_date", every="1d")
+        .agg(
+            pl.col("profit_ratio").sum().alias("profit_ratio_sum"),
+            pl.col("profit_abs").sum().round(10).alias("profit_abs_sum"),
+        )
+    )
+    worst_rel = daily["profit_ratio_sum"].min()
+    best_rel = daily["profit_ratio_sum"].max()
+    worst = daily["profit_abs_sum"].min()
+    best = daily["profit_abs_sum"].max()
+    winning_days = daily.filter(pl.col("profit_abs_sum") > 0).height
+    draw_days = daily.filter(pl.col("profit_abs_sum") == 0).height
+    losing_days = daily.filter(pl.col("profit_abs_sum") < 0).height
+    daily_profit_list = [
+        (str(row[0].date()), row[1])
+        for row in daily.select("close_date", "profit_abs_sum").iter_rows()
+    ]
 
     return {
         "backtest_best_day": best_rel,
@@ -470,18 +469,8 @@ def generate_strategy_stats(
     market_change: float,
     is_hyperopt: bool = False,
 ) -> dict[str, Any]:
-    """
-    :param pairlist: List of pairs to backtest
-    :param strategy: Strategy name
-    :param content: Backtest result data in the format:
-                    {'results: results, 'config: config}}.
-    :param min_date: Backtest start date
-    :param max_date: Backtest end date
-    :param market_change: float indicating the market change
-    :return: Dictionary containing results per strategy and a strategy summary.
-    """
-    results: DataFrame = content["results"]
-    if not isinstance(results, DataFrame):
+    results: pl.DataFrame = content["results"]
+    if not isinstance(results, pl.DataFrame):
         return {}
     config = content["config"]
     max_open_trades = min(config["max_open_trades"], len(pairlist))
@@ -526,7 +515,7 @@ def generate_strategy_stats(
         pairlist,
         stake_currency=stake_currency,
         starting_balance=start_balance,
-        results=results.loc[results["exit_reason"] == "force_exit"],
+        results=results.filter(pl.col("exit_reason") == "force_exit"),
         min_date=min_date,
         max_date=max_date,
         skip_nan=True,
@@ -555,13 +544,14 @@ def generate_strategy_stats(
         if len(pair_results) > 1
         else None
     )
-    winning_profit = results.loc[results["profit_abs"] > 0, "profit_abs"].sum()
-    losing_profit = results.loc[results["profit_abs"] < 0, "profit_abs"].sum()
+    winning_profit = results.filter(pl.col("profit_abs") > 0)["profit_abs"].sum()
+    losing_profit = results.filter(pl.col("profit_abs") < 0)["profit_abs"].sum()
     profit_factor = winning_profit / abs(losing_profit) if losing_profit else 0.0
 
+    n = results.height
     expectancy, expectancy_ratio = calculate_expectancy(results)
     backtest_days = (max_date - min_date).days or 1
-    trades_dict = results.to_dict(orient="records")
+    trades_dict = results.to_dicts()
     strat_stats = {
         "trades": trades_dict,
         "locks": [lock.to_json() for lock in content["locks"]],
@@ -572,19 +562,19 @@ def generate_strategy_stats(
         "exit_reason_summary": exit_reason_stats,
         "mix_tag_stats": mix_tag_stats,
         "left_open_trades": left_open_results,
-        "total_trades": len(results),
-        "trade_count_long": len(results.loc[~results["is_short"]]),
-        "trade_count_short": len(results.loc[results["is_short"]]),
+        "total_trades": n,
+        "trade_count_long": results.filter(~pl.col("is_short")).height,
+        "trade_count_short": results.filter(pl.col("is_short")).height,
         "total_volume": calculate_trade_volume(trades_dict),
-        "avg_stake_amount": results["stake_amount"].mean() if len(results) > 0 else 0,
-        "profit_mean": results["profit_ratio"].mean() if len(results) > 0 else 0,
-        "profit_median": results["profit_ratio"].median() if len(results) > 0 else 0,
+        "avg_stake_amount": results["stake_amount"].mean() if n > 0 else 0,
+        "profit_mean": results["profit_ratio"].mean() if n > 0 else 0,
+        "profit_median": results["profit_ratio"].median() if n > 0 else 0,
         "profit_total": results["profit_abs"].sum() / start_balance,
-        "profit_total_long": results.loc[~results["is_short"], "profit_abs"].sum() / start_balance,
-        "profit_total_short": results.loc[results["is_short"], "profit_abs"].sum() / start_balance,
+        "profit_total_long": results.filter(~pl.col("is_short"))["profit_abs"].sum() / start_balance,
+        "profit_total_short": results.filter(pl.col("is_short"))["profit_abs"].sum() / start_balance,
         "profit_total_abs": results["profit_abs"].sum(),
-        "profit_total_long_abs": results.loc[~results["is_short"], "profit_abs"].sum(),
-        "profit_total_short_abs": results.loc[results["is_short"], "profit_abs"].sum(),
+        "profit_total_long_abs": results.filter(~pl.col("is_short"))["profit_abs"].sum(),
+        "profit_total_short_abs": results.filter(pl.col("is_short"))["profit_abs"].sum(),
         "cagr": calculate_cagr(backtest_days, start_balance, content["final_balance"]),
         "expectancy": expectancy,
         "expectancy_ratio": expectancy_ratio,
@@ -600,7 +590,7 @@ def generate_strategy_stats(
         "backtest_days": backtest_days,
         "backtest_run_start_ts": content["backtest_start_time"],
         "backtest_run_end_ts": content["backtest_end_time"],
-        "trades_per_day": round(len(results) / backtest_days, 2),
+        "trades_per_day": round(n / backtest_days, 2),
         "market_change": market_change,
         "pairlist": pairlist,
         "stake_amount": config["stake_amount"],
@@ -647,7 +637,6 @@ def generate_strategy_stats(
         drawdown = calculate_max_drawdown(
             results, value_col="profit_abs", starting_balance=start_balance
         )
-        # max_relative_drawdown = Underwater
         underwater = calculate_max_drawdown(
             results, value_col="profit_abs", starting_balance=start_balance, relative=True
         )
@@ -693,20 +682,12 @@ def generate_strategy_stats(
 
 
 def generate_backtest_stats(
-    btdata: dict[str, DataFrame],
+    btdata: dict[str, pl.DataFrame],
     all_results: dict[str, BacktestContentType],
     min_date: datetime,
     max_date: datetime,
     notes: str | None = None,
 ) -> BacktestResultType:
-    """
-    :param btdata: Backtest data
-    :param all_results: backtest result - dictionary in the form:
-                     { Strategy: {'results: results, 'config: config}}.
-    :param min_date: Backtest start date
-    :param max_date: Backtest end date
-    :return: Dictionary containing results per strategy and a strategy summary.
-    """
     result: BacktestResultType = get_BacktestResultType_default()
     market_change = calculate_market_change(btdata, "close", min_date=min_date)
     metadata = {}

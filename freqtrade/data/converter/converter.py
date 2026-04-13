@@ -4,15 +4,87 @@ Functions to convert data from one format to another
 
 import logging
 
-import numpy as np
-import pandas as pd
-from pandas import DataFrame, to_datetime
+import polars as pl
 
-from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS, Config
+from freqtrade.constants import Config
 from freqtrade.enums import CandleType, TradingMode
 
 
 logger = logging.getLogger(__name__)
+
+
+def _seconds_to_polars_duration(seconds: int) -> str:
+    """Convert a timeframe expressed in seconds to a polars duration string."""
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _ohlcv_fill_up_missing_data_pl(
+    dataframe: pl.DataFrame, timeframe: str, pair: str
+) -> pl.DataFrame:
+    """Polars version of ohlcv_fill_up_missing_data."""
+    from freqtrade.exchange import timeframe_to_seconds
+
+    every = _seconds_to_polars_duration(timeframe_to_seconds(timeframe))
+    len_before = len(dataframe)
+    if len_before == 0:
+        return dataframe
+
+    df = dataframe.sort("date").upsample(time_column="date", every=every)
+    df = df.with_columns(pl.col("close").forward_fill())
+    df = df.with_columns(
+        pl.col("open").fill_null(pl.col("close")),
+        pl.col("high").fill_null(pl.col("close")),
+        pl.col("low").fill_null(pl.col("close")),
+        pl.col("volume").fill_null(0.0),
+    )
+
+    len_after = len(df)
+    if len_before != len_after:
+        pct_missing = (len_after - len_before) / len_before
+        message = (
+            f"Missing data fillup for {pair}, {timeframe}: "
+            f"before: {len_before} - after: {len_after} - {pct_missing:.2%}"
+        )
+        if pct_missing > 0.01:
+            logger.info(message)
+        else:
+            logger.debug(message)
+    return df
+
+
+def _clean_ohlcv_dataframe_pl(
+    dataframe: pl.DataFrame,
+    timeframe: str,
+    pair: str,
+    *,
+    fill_missing: bool,
+    drop_incomplete: bool,
+) -> pl.DataFrame:
+    """Polars version of clean_ohlcv_dataframe."""
+    dataframe = (
+        dataframe.group_by("date")
+        .agg(
+            pl.col("open").first(),
+            pl.col("high").max(),
+            pl.col("low").min(),
+            pl.col("close").last(),
+            pl.col("volume").sum(),
+        )
+        .sort("date")
+    )
+    if drop_incomplete:
+        dataframe = dataframe.head(len(dataframe) - 1)
+        logger.debug("Dropping last candle")
+
+    if fill_missing:
+        return _ohlcv_fill_up_missing_data_pl(dataframe, timeframe, pair)
+    return dataframe
 
 
 def ohlcv_to_dataframe(
@@ -22,142 +94,85 @@ def ohlcv_to_dataframe(
     *,
     fill_missing: bool = True,
     drop_incomplete: bool = True,
-) -> DataFrame:
+) -> pl.DataFrame:
     """
     Converts a list with candle (OHLCV) data (in format returned by ccxt.fetch_ohlcv)
-    to a Dataframe
+    to a polars DataFrame.
     :param ohlcv: list with candle (OHLCV) data, as returned by exchange.async_get_candle_history
     :param timeframe: timeframe (e.g. 5m). Used to fill up eventual missing data
     :param pair: Pair this data is for (used to warn if fillup was necessary)
     :param fill_missing: fill up missing candles with 0 candles
-                         (see ohlcv_fill_up_missing_data for details)
     :param drop_incomplete: Drop the last candle of the dataframe, assuming it's incomplete
-    :return: DataFrame
+    :return: polars DataFrame
     """
+    from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS
+    from freqtrade.exchange import timeframe_to_seconds
+
     logger.debug(f"Converting candle (OHLCV) data to dataframe for pair {pair}.")
     cols = DEFAULT_DATAFRAME_COLUMNS
-    df = DataFrame(ohlcv, columns=cols)
 
-    # Floor date to seconds to account for exchange imprecisions
-    from freqtrade.exchange import timeframe_to_floor_freq
+    df = pl.DataFrame(ohlcv, schema=cols, orient="row")
 
-    resample_interval = timeframe_to_floor_freq(timeframe)
-
-    df["date"] = to_datetime(df["date"], unit="ms", utc=True).dt.floor(resample_interval)
-
-    # Some exchanges return int values for Volume and even for OHLC.
-    # Convert them since TA-LIB indicators used in the strategy assume floats
-    # and fail with exception...
-    df = df.astype(
-        dtype={
-            "open": "float",
-            "high": "float",
-            "low": "float",
-            "close": "float",
-            "volume": "float",
-        }
+    # Floor date to timeframe interval
+    tf_seconds = timeframe_to_seconds(timeframe)
+    duration = _seconds_to_polars_duration(tf_seconds)
+    df = df.with_columns(
+        pl.from_epoch(pl.col("date"), time_unit="ms").dt.replace_time_zone("UTC").dt.truncate(duration).alias("date"),
+        pl.col("open").cast(pl.Float64),
+        pl.col("high").cast(pl.Float64),
+        pl.col("low").cast(pl.Float64),
+        pl.col("close").cast(pl.Float64),
+        pl.col("volume").cast(pl.Float64),
     )
+
     return clean_ohlcv_dataframe(
         df, timeframe, pair, fill_missing=fill_missing, drop_incomplete=drop_incomplete
     )
 
 
 def clean_ohlcv_dataframe(
-    dataframe: DataFrame, timeframe: str, pair: str, *, fill_missing: bool, drop_incomplete: bool
-) -> DataFrame:
+    dataframe: pl.DataFrame, timeframe: str, pair: str, *, fill_missing: bool, drop_incomplete: bool
+) -> pl.DataFrame:
     """
     Cleanse a OHLCV dataframe by
       * Grouping it by date (removes duplicate tics)
       * dropping last candles if requested
       * Filling up missing data (if requested)
-    :param dataframe: DataFrame containing candle (OHLCV) data.
+    :param dataframe: polars DataFrame containing candle (OHLCV) data.
     :param timeframe: timeframe (e.g. 5m). Used to fill up eventual missing data
     :param pair: Pair this data is for (used to warn if fillup was necessary)
     :param fill_missing: fill up missing candles with 0 candles
-                         (see ohlcv_fill_up_missing_data for details)
     :param drop_incomplete: Drop the last candle of the dataframe, assuming it's incomplete
-    :return: DataFrame
+    :return: polars DataFrame
     """
-    # group by index and aggregate results to eliminate duplicate ticks
-    dataframe = dataframe.groupby(by="date", as_index=False, sort=True).agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "max",
-        }
+    return _clean_ohlcv_dataframe_pl(
+        dataframe, timeframe, pair,
+        fill_missing=fill_missing, drop_incomplete=drop_incomplete
     )
-    # eliminate partial candle
-    if drop_incomplete:
-        dataframe.drop(dataframe.tail(1).index, inplace=True)
-        logger.debug("Dropping last candle")
-
-    if fill_missing:
-        return ohlcv_fill_up_missing_data(dataframe, timeframe, pair)
-    else:
-        return dataframe
 
 
-def ohlcv_fill_up_missing_data(dataframe: DataFrame, timeframe: str, pair: str) -> DataFrame:
-    """
-    Fills up missing data with 0 volume rows,
-    using the previous close as price for "open", "high", "low" and "close", volume is set to 0
-
-    """
-    from freqtrade.exchange import timeframe_to_resample_freq
-
-    ohlcv_dict = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    resample_interval = timeframe_to_resample_freq(timeframe)
-    # Resample to create "NAN" values
-    df = dataframe.resample(resample_interval, on="date").agg(ohlcv_dict)
-
-    # Forwardfill close for missing columns
-    df["close"] = df["close"].ffill()
-    # Use close for "open, high, low"
-    df.loc[:, ["open", "high", "low"]] = df[["open", "high", "low"]].fillna(
-        value={
-            "open": df["close"],
-            "high": df["close"],
-            "low": df["close"],
-        }
-    )
-    df.reset_index(inplace=True)
-    len_before = len(dataframe)
-    len_after = len(df)
-    pct_missing = (len_after - len_before) / len_before if len_before > 0 else 0
-    if len_before != len_after:
-        message = (
-            f"Missing data fillup for {pair}, {timeframe}: "
-            f"before: {len_before} - after: {len_after} - {pct_missing:.2%}"
-        )
-        if pct_missing > 0.01:
-            logger.info(message)
-        else:
-            # Don't be verbose if only a small amount is missing
-            logger.debug(message)
-    return df
+# Keep alias for compatibility
+ohlcv_fill_up_missing_data = _ohlcv_fill_up_missing_data_pl
 
 
 def trim_dataframe(
-    df: DataFrame, timerange, *, df_date_col: str = "date", startup_candles: int = 0
-) -> DataFrame:
+    df: pl.DataFrame, timerange, *, df_date_col: str = "date", startup_candles: int = 0
+) -> pl.DataFrame:
     """
     Trim dataframe based on given timerange
-    :param df: Dataframe to trim
+    :param df: polars Dataframe to trim
     :param timerange: timerange (use start and end date if available)
     :param df_date_col: Column in the dataframe to use as Date column
     :param startup_candles: When not 0, is used instead the timerange start date
     :return: trimmed dataframe
     """
     if startup_candles:
-        # Trim candles instead of timeframe in case of given startup_candle count
-        df = df.iloc[startup_candles:, :]
+        df = df.slice(startup_candles)
     else:
         if timerange.starttype == "date":
-            df = df.loc[df[df_date_col] >= timerange.startdt, :]
+            df = df.filter(pl.col(df_date_col) >= timerange.startdt)
     if timerange.stoptype == "date":
-        df = df.loc[df[df_date_col] <= timerange.stopdt, :]
+        df = df.filter(pl.col(df_date_col) <= timerange.stopdt)
     return df
 
 
@@ -165,74 +180,49 @@ def trim_dataframes(
     preprocessed: dict, timerange, startup_candles: int
 ) -> dict:
     """
-    Trim startup period from analyzed dataframes (polars or pandas)
+    Trim startup period from analyzed dataframes
     :param preprocessed: Dict of pair: dataframe
     :param timerange: timerange (use start and end date if available)
     :param startup_candles: Startup-candles that should be removed
     :return: Dict of trimmed dataframes
     """
-    import polars as pl
-
     processed: dict = {}
 
     for pair, df in preprocessed.items():
-        if isinstance(df, pl.DataFrame):
-            trimed_df = df
-            if startup_candles:
-                trimed_df = trimed_df.slice(startup_candles)
-            else:
-                if timerange.starttype == "date":
-                    trimed_df = trimed_df.filter(pl.col("date") >= timerange.startdt)
-            if timerange.stoptype == "date":
-                trimed_df = trimed_df.filter(pl.col("date") <= timerange.stopdt)
-            if len(trimed_df) > 0:
-                processed[pair] = trimed_df
-            else:
-                logger.warning(
-                    f"{pair} has no data left after adjusting for startup candles, skipping."
-                )
+        trimed_df = df
+        if startup_candles:
+            trimed_df = trimed_df.slice(startup_candles)
         else:
-            trimed_df = trim_dataframe(df, timerange, startup_candles=startup_candles)
-            if not trimed_df.empty:
-                processed[pair] = trimed_df
-            else:
-                logger.warning(
-                    f"{pair} has no data left after adjusting for startup candles, skipping."
-                )
+            if timerange.starttype == "date":
+                trimed_df = trimed_df.filter(pl.col("date") >= timerange.startdt)
+        if timerange.stoptype == "date":
+            trimed_df = trimed_df.filter(pl.col("date") <= timerange.stopdt)
+        if len(trimed_df) > 0:
+            processed[pair] = trimed_df
+        else:
+            logger.warning(
+                f"{pair} has no data left after adjusting for startup candles, skipping."
+            )
     return processed
 
 
-def order_book_to_dataframe(bids: list, asks: list) -> DataFrame:
+def order_book_to_dataframe(bids: list, asks: list) -> pl.DataFrame:
     """
     Gets order book list, returns dataframe with below format per suggested by creslin
     -------------------------------------------------------------------
      b_sum       b_size       bids       asks       a_size       a_sum
     -------------------------------------------------------------------
     """
-    cols = ["bids", "b_size"]
+    bids_df = pl.DataFrame({"bids": [b[0] for b in bids], "b_size": [b[1] for b in bids]})
+    bids_df = bids_df.with_columns(pl.col("b_size").cum_sum().alias("b_sum"))
 
-    bids_frame = DataFrame(bids, columns=cols)
-    # add cumulative sum column
-    bids_frame["b_sum"] = bids_frame["b_size"].cumsum()
-    cols2 = ["asks", "a_size"]
-    asks_frame = DataFrame(asks, columns=cols2)
-    # add cumulative sum column
-    asks_frame["a_sum"] = asks_frame["a_size"].cumsum()
+    asks_df = pl.DataFrame({"asks": [a[0] for a in asks], "a_size": [a[1] for a in asks]})
+    asks_df = asks_df.with_columns(pl.col("a_size").cum_sum().alias("a_sum"))
 
-    frame = pd.concat(
-        [
-            bids_frame["b_sum"],
-            bids_frame["b_size"],
-            bids_frame["bids"],
-            asks_frame["asks"],
-            asks_frame["a_size"],
-            asks_frame["a_sum"],
-        ],
-        axis=1,
-        keys=["b_sum", "b_size", "bids", "asks", "a_size", "a_sum"],
-    )
-    # logger.info('order book %s', frame )
-    return frame
+    return pl.concat([
+        bids_df.select("b_sum", "b_size", "bids"),
+        asks_df.select("asks", "a_size", "a_sum"),
+    ], how="horizontal")
 
 
 def convert_ohlcv_format(
@@ -299,25 +289,20 @@ def convert_ohlcv_format(
                 src.ohlcv_purge(pair=pair, timeframe=timeframe, candle_type=candle_type)
 
 
-def reduce_dataframe_footprint(df: DataFrame) -> DataFrame:
+def reduce_dataframe_footprint(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Ensure all values are float32 in the incoming dataframe.
-    :param df: Dataframe to be converted to float/int 32s
-    :return: Dataframe converted to float/int 32s
+    Ensure non-OHLCV float columns are float32 for memory savings.
+    :param df: polars DataFrame to optimize
+    :return: optimized polars DataFrame
     """
-
-    logger.debug(f"Memory usage of dataframe is {df.memory_usage().sum() / 1024**2:.2f} MB")
-
-    df_dtypes = df.dtypes
-    for column, dtype in df_dtypes.items():
-        if column in ["open", "high", "low", "close", "volume"]:
+    cast_exprs = []
+    for col_name, dtype in zip(df.columns, df.dtypes):
+        if col_name in ("open", "high", "low", "close", "volume"):
             continue
-        if dtype == np.float64:
-            df_dtypes[column] = np.float32
-        elif dtype == np.int64:
-            df_dtypes[column] = np.int32
-    df = df.astype(df_dtypes)
-
-    logger.debug(f"Memory usage after optimization is: {df.memory_usage().sum() / 1024**2:.2f} MB")
-
+        if dtype == pl.Float64:
+            cast_exprs.append(pl.col(col_name).cast(pl.Float32))
+        elif dtype == pl.Int64:
+            cast_exprs.append(pl.col(col_name).cast(pl.Int32))
+    if cast_exprs:
+        df = df.with_columns(cast_exprs)
     return df

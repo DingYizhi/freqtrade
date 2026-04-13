@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import polars as pl
-from pandas import DataFrame
 
 from freqtrade.configuration import TimeRange
 from freqtrade.constants import Config, ListPairsWithTimeframes, PairWithTimeframe
@@ -20,7 +19,6 @@ from freqtrade.enums import CandleType, RunMode, TradingMode
 from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.exchange import Exchange, timeframe_to_prev_date, timeframe_to_seconds
 from freqtrade.exchange.exchange_types import FundingRate, OrderBook
-from freqtrade.misc import append_candles_to_dataframe
 from freqtrade.util import PeriodicCache
 
 
@@ -46,7 +44,9 @@ class DataProvider:
         self.__slice_index: dict[str, int] = {}
         self.__slice_date: datetime | None = None
 
-        self.__cached_pairs_backtesting: dict[PairWithTimeframe, DataFrame] = {}
+        self.__cached_pairs_backtesting: dict[PairWithTimeframe, pl.DataFrame] = {}
+        # Cache for get_current_candle: {(pair, tf, candle_type): (slice_index, row_dict)}
+        self.__current_row_cache: dict[PairWithTimeframe, tuple[int, dict]] = {}
         self._msg_queue: deque = deque()
 
         self._default_candle_type = self._config.get("candle_type_def", CandleType.SPOT)
@@ -87,7 +87,7 @@ class DataProvider:
         pair_key = (pair, timeframe, candle_type)
         self.__cached_pairs[pair_key] = (dataframe, datetime.now(UTC))
 
-    def _emit_df(self, pair_key: PairWithTimeframe, dataframe: DataFrame, new_candle: bool) -> None:
+    def _emit_df(self, pair_key: PairWithTimeframe, dataframe: pl.DataFrame, new_candle: bool) -> None:
         return None
 
     def add_pairlisthandler(self, pairlists) -> None:
@@ -96,7 +96,7 @@ class DataProvider:
         """
         self._pairlists = pairlists
 
-    def historic_ohlcv(self, pair: str, timeframe: str, candle_type: str = "") -> DataFrame:
+    def historic_ohlcv(self, pair: str, timeframe: str, candle_type: str = "") -> pl.DataFrame:
         """
         Get stored historical candle (OHLCV) data
         :param pair: pair to get the data for
@@ -133,7 +133,7 @@ class DataProvider:
                 data_format=self._config["dataformat_ohlcv"],
                 candle_type=_candle_type,
             )
-        return self.__cached_pairs_backtesting[saved_pair].copy()
+        return self.__cached_pairs_backtesting[saved_pair].clone()
 
     def get_required_startup(self, timeframe: str) -> int:
         return self._config.get("startup_candle_count", 0)
@@ -145,8 +145,6 @@ class DataProvider:
             candle_type == CandleType.FUNDING_RATE
             and (ff_tf := self.get_funding_rate_timeframe()) != timeframe
         ):
-            # TODO: does this message make sense? might be pointless as funding fees don't
-            # have a timeframe
             logger.warning(
                 f"{pair}, {timeframe} requested - funding rate timeframe not matching {ff_tf}."
             )
@@ -156,7 +154,7 @@ class DataProvider:
 
     def get_pair_dataframe(
         self, pair: str, timeframe: str | None = None, candle_type: str = ""
-    ) -> DataFrame:
+    ) -> pl.DataFrame:
         """
         Return pair candle (OHLCV) data, either live or cached historical -- depending
         on the runmode.
@@ -164,7 +162,7 @@ class DataProvider:
         will be available.
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
-        :return: Dataframe for this pair
+        :return: polars DataFrame for this pair
         :param candle_type: '', mark, index, premiumIndex, or funding_rate
         """
         timeframe = self.__fix_funding_rate_timeframe(pair, timeframe, candle_type)
@@ -179,7 +177,7 @@ class DataProvider:
             # This is necessary to prevent lookahead bias in callbacks through informative pairs.
             if self.__slice_date:
                 cutoff_date = timeframe_to_prev_date(timeframe, self.__slice_date)
-                data = data.loc[data["date"] < cutoff_date]
+                data = data.filter(pl.col("date") < cutoff_date)
         if len(data) == 0:
             logger.warning(f"No data found for ({pair}, {timeframe}, {candle_type}).")
         return data
@@ -208,6 +206,39 @@ class DataProvider:
             return df, date
         else:
             return (pl.DataFrame(), datetime.fromtimestamp(0, tz=UTC))
+
+    def get_current_candle(self, pair: str, timeframe: str) -> dict:
+        """
+        Return the current bar's analyzed row as a plain Python dict (backtesting only).
+        Cached per slice index — safe to call multiple times per bar with zero extra cost.
+
+        Intended for use inside callbacks (custom_exit, adjust_trade_position) that need
+        indicator values for the current bar without going through
+        get_analyzed_dataframe().row(-1, named=True).
+
+        :param pair: pair to get the data for
+        :param timeframe: timeframe to get data for
+        :return: dict of column → value for the current bar, or {} if unavailable
+        """
+        pair_key = (pair, timeframe, self._config.get("candle_type_def", CandleType.SPOT))
+        idx = self.__slice_index.get(pair)
+        if idx is None:
+            return {}
+        cached = self.__current_row_cache.get(pair_key)
+        if cached is not None and cached[0] == idx:
+            return cached[1]
+        # Cache miss — compute from full cached df at current slice index
+        entry = self.__cached_pairs.get(pair_key)
+        if entry is None:
+            return {}
+        df = entry[0]
+        start = max(0, idx - MAX_DATAFRAME_CANDLES)
+        length = idx - start
+        if length <= 0:
+            return {}
+        row = df.slice(start, length).row(-1, named=True)
+        self.__current_row_cache[pair_key] = (idx, row)
+        return row
 
     @property
     def runmode(self) -> RunMode:
@@ -240,6 +271,7 @@ class DataProvider:
         # otherwise they're reloaded each time during hyperopt due to with analyze_per_epoch
         # self.__cached_pairs_backtesting = {}
         self.__slice_index = {}
+        self.__current_row_cache = {}
 
     # Exchange functions
 
@@ -281,15 +313,14 @@ class DataProvider:
 
     def ohlcv(
         self, pair: str, timeframe: str | None = None, copy: bool = True, candle_type: str = ""
-    ) -> DataFrame:
+    ) -> pl.DataFrame:
         """
-        Get candle (OHLCV) data for the given pair as DataFrame
+        Get candle (OHLCV) data for the given pair as polars DataFrame
         Please use the `available_pairs` method to verify which pairs are currently cached.
         :param pair: pair to get the data for
         :param timeframe: Timeframe to get data for
         :param candle_type: '', mark, index, premiumIndex, or funding_rate
         :param copy: copy dataframe before returning if True.
-                     Use False only for read-only operations (where the dataframe is not modified)
         """
         if self._exchange is None:
             raise OperationalException(NO_EXCHANGE_EXCEPTION)
@@ -303,7 +334,7 @@ class DataProvider:
                 (pair, timeframe or self._config["timeframe"], _candle_type), copy=copy
             )
         else:
-            return DataFrame()
+            return pl.DataFrame()
 
     def trades(
         self,
@@ -312,16 +343,13 @@ class DataProvider:
         copy: bool = True,
         candle_type: str = "",
         timerange: TimeRange | None = None,
-    ) -> DataFrame:
+    ) -> pl.DataFrame:
         """
-        Get candle (TRADES) data for the given pair as DataFrame
-        Please use the `available_pairs` method to verify which pairs are currently cached.
-        This is not meant to be used in callbacks because of lookahead bias.
+        Get candle (TRADES) data for the given pair as polars DataFrame
         :param pair: pair to get the data for
         :param timeframe: Timeframe to get data for
         :param candle_type: '', mark, index, premiumIndex, or funding_rate
         :param copy: copy dataframe before returning if True.
-                     Use False only for read-only operations (where the dataframe is not modified)
         """
         if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
             if self._exchange is None:
@@ -385,9 +413,6 @@ class DataProvider:
         Warning: Performs a network request - so use with common sense.
         :param pair: Pair to get the data for
         :return: Funding rate dict from exchange or empty dict if funding rate is not available
-            If available, the "fundingRate" field will contain the funding rate.
-            "fundingTimestamp" and "fundingDatetime" will contain the next funding times.
-            Actually filled fields may vary between exchanges.
         """
         if self._exchange is None:
             raise OperationalException(NO_EXCHANGE_EXCEPTION)

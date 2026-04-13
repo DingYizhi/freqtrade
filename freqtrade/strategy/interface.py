@@ -10,11 +10,9 @@ from datetime import UTC, datetime, timedelta
 from math import isinf, isnan
 
 import polars as pl
-from pandas import DataFrame
 
 from freqtrade.configuration import TimeRange
 from freqtrade.constants import CUSTOM_TAG_MAX_LENGTH, Config, IntOrInf, ListPairsWithTimeframes
-from freqtrade.data.converter import populate_dataframe_with_trades
 from freqtrade.data.converter.converter import reduce_dataframe_footprint
 from freqtrade.data.dataprovider import DataProvider
 from freqtrade.enums import (
@@ -30,7 +28,6 @@ from freqtrade.enums import (
 )
 from freqtrade.exceptions import OperationalException, StrategyError
 from freqtrade.exchange import timeframe_to_minutes, timeframe_to_next_date, timeframe_to_seconds
-from freqtrade.misc import remove_entry_exit_signals
 from freqtrade.persistence import Order, PairLocks, Trade
 from freqtrade.strategy.hyper import HyperStrategyMixin
 from freqtrade.strategy.informative_decorator import (
@@ -152,7 +149,7 @@ class IStrategy(ABC, HyperStrategyMixin):
     market_direction: MarketDirection = MarketDirection.NONE
 
     # Global cache dictionary
-    _cached_grouped_trades_per_pair: dict[str, DataFrame] = {}
+    _cached_grouped_trades_per_pair: dict[str, pl.DataFrame] = {}
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -225,49 +222,49 @@ class IStrategy(ABC, HyperStrategyMixin):
         self._minimal_roi_keys = sorted(self.minimal_roi.keys())
 
     @abstractmethod
-    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def populate_indicators(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Populate indicators that will be used in the Buy, Sell, Short, Exit_short strategy
-        :param dataframe: DataFrame with data from the exchange
+        :param dataframe: pl.DataFrame with data from the exchange
         :param metadata: Additional information, like the currently traded pair
         :return: a Dataframe with all mandatory indicators for the strategies
         """
         return dataframe
 
-    def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def populate_buy_trend(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         DEPRECATED - please migrate to populate_entry_trend
-        :param dataframe: DataFrame
+        :param dataframe: pl.DataFrame
         :param metadata: Additional information, like the currently traded pair
-        :return: DataFrame with buy column
+        :return: pl.DataFrame with buy column
         """
         return dataframe
 
-    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def populate_entry_trend(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Based on TA indicators, populates the entry signal for the given dataframe
-        :param dataframe: DataFrame
+        :param dataframe: pl.DataFrame
         :param metadata: Additional information, like the currently traded pair
-        :return: DataFrame with entry columns populated
+        :return: pl.DataFrame with entry columns populated
         """
         return self.populate_buy_trend(dataframe, metadata)
 
-    def populate_sell_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def populate_sell_trend(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         DEPRECATED - please migrate to populate_exit_trend
         Based on TA indicators, populates the sell signal for the given dataframe
-        :param dataframe: DataFrame
+        :param dataframe: pl.DataFrame
         :param metadata: Additional information, like the currently traded pair
-        :return: DataFrame with sell column
+        :return: pl.DataFrame with sell column
         """
         return dataframe
 
-    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def populate_exit_trend(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Based on TA indicators, populates the exit signal for the given dataframe
-        :param dataframe: DataFrame
+        :param dataframe: pl.DataFrame
         :param metadata: Additional information, like the currently traded pair
-        :return: DataFrame with exit columns populated
+        :return: pl.DataFrame with exit columns populated
         """
         return self.populate_sell_trend(dataframe, metadata)
 
@@ -871,11 +868,11 @@ class IStrategy(ABC, HyperStrategyMixin):
     def populate_any_indicators(
         self,
         pair: str,
-        df: DataFrame,
+        df: pl.DataFrame,
         tf: str,
-        informative: DataFrame | None = None,
+        informative: pl.DataFrame | None = None,
         set_generalized_indicators: bool = False,
-    ) -> DataFrame:
+    ) -> pl.DataFrame:
         """
         DEPRECATED - USE FEATURE ENGINEERING FUNCTIONS INSTEAD
         Function designed to automatically generate, name and merge features
@@ -891,8 +888,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         return df
 
     def feature_engineering_expand_all(
-        self, dataframe: DataFrame, period: int, metadata: dict, **kwargs
-    ) -> DataFrame:
+        self, dataframe: pl.DataFrame, period: int, metadata: dict, **kwargs
+    ) -> pl.DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         This function will automatically expand the defined features on the config defined
@@ -919,8 +916,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         return dataframe
 
     def feature_engineering_expand_basic(
-        self, dataframe: DataFrame, metadata: dict, **kwargs
-    ) -> DataFrame:
+        self, dataframe: pl.DataFrame, metadata: dict, **kwargs
+    ) -> pl.DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         This function will automatically expand the defined features on the config defined
@@ -950,8 +947,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         return dataframe
 
     def feature_engineering_standard(
-        self, dataframe: DataFrame, metadata: dict, **kwargs
-    ) -> DataFrame:
+        self, dataframe: pl.DataFrame, metadata: dict, **kwargs
+    ) -> pl.DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         This optional function will be called once with the dataframe of the base timeframe.
@@ -975,7 +972,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         return dataframe
 
-    def set_freqai_targets(self, dataframe: DataFrame, metadata: dict, **kwargs) -> DataFrame:
+    def set_freqai_targets(self, dataframe: pl.DataFrame, metadata: dict, **kwargs) -> pl.DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         Required function to set the targets for the model.
@@ -1145,14 +1142,14 @@ class IStrategy(ABC, HyperStrategyMixin):
             lock_time = timeframe_to_next_date(self.timeframe, candle_date)
             return PairLocks.is_pair_locked(pair, lock_time, side=side)
 
-    def analyze_ticker(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def analyze_ticker(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
-        Parses the given candle (OHLCV) data and returns a populated DataFrame
+        Parses the given candle (OHLCV) data and returns a populated pl.DataFrame
         add several TA indicators and entry order signal to it
         Should only be used in live.
         :param dataframe: Dataframe containing data from exchange
         :param metadata: Metadata dictionary with additional data (e.g. 'pair')
-        :return: DataFrame of candle (OHLCV) data with indicator data and signals added
+        :return: pl.DataFrame of candle (OHLCV) data with indicator data and signals added
         """
         logger.debug("TA Analysis Launched")
         dataframe = self.advise_indicators(dataframe, metadata)
@@ -1161,25 +1158,25 @@ class IStrategy(ABC, HyperStrategyMixin):
         logger.debug("TA Analysis Ended")
         return dataframe
 
-    def _analyze_ticker_internal(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def _analyze_ticker_internal(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
-        Parses the given candle (OHLCV) data and returns a populated DataFrame
+        Parses the given candle (OHLCV) data and returns a populated pl.DataFrame
         add several TA indicators and buy signal to it
         WARNING: Used internally only, may skip analysis if `process_only_new_candles` is set.
         :param dataframe: Dataframe containing data from exchange
         :param metadata: Metadata dictionary with additional data (e.g. 'pair')
-        :return: DataFrame of candle (OHLCV) data with indicator data and signals added
+        :return: pl.DataFrame of candle (OHLCV) data with indicator data and signals added
         """
         pair = str(metadata.get("pair"))
 
-        new_candle = self.__last_candle_seen_per_pair.get(pair, None) != dataframe.iloc[-1]["date"]
+        new_candle = self.__last_candle_seen_per_pair.get(pair, None) != dataframe["date"][-1]
         # Test if seen this pair and last candle before.
         # always run if process_only_new_candles is set to false
         if not self.process_only_new_candles or new_candle:
             # Defs that only make change on new candle data.
             dataframe = self.analyze_ticker(dataframe, metadata)
 
-            self.__last_candle_seen_per_pair[pair] = dataframe.iloc[-1]["date"]
+            self.__last_candle_seen_per_pair[pair] = dataframe["date"][-1]
 
             candle_type = self.config.get("candle_type_def", CandleType.SPOT)
             self.dp._set_cached_df(pair, self.timeframe, dataframe, candle_type=candle_type)
@@ -1187,7 +1184,15 @@ class IStrategy(ABC, HyperStrategyMixin):
 
         else:
             logger.debug("Skipping TA Analysis for already analyzed candle")
-            dataframe = remove_entry_exit_signals(dataframe)
+            # In live mode, clear entry/exit signals for already analyzed candles
+            dataframe = dataframe.with_columns(
+                pl.lit(0).alias(SignalType.ENTER_LONG.value),
+                pl.lit(0).alias(SignalType.EXIT_LONG.value),
+                pl.lit(0).alias(SignalType.ENTER_SHORT.value),
+                pl.lit(0).alias(SignalType.EXIT_SHORT.value),
+                pl.lit(None).cast(pl.Utf8).alias(SignalTagType.ENTER_TAG.value),
+                pl.lit(None).cast(pl.Utf8).alias(SignalTagType.EXIT_TAG.value),
+            )
 
         logger.debug("Loop Analysis Launched")
 
@@ -1203,7 +1208,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         dataframe = self.dp.ohlcv(
             pair, self.timeframe, candle_type=self.config.get("candle_type_def", CandleType.SPOT)
         )
-        if not isinstance(dataframe, DataFrame) or dataframe.empty:
+        if not isinstance(dataframe, pl.DataFrame) or dataframe.is_empty():
             logger.warning("Empty candle (OHLCV) data for pair %s", pair)
             return
 
@@ -1221,7 +1226,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             logger.warning(f"Unable to analyze candle (OHLCV) data for pair {pair}: {error}")
             return
 
-        if dataframe.empty:
+        if dataframe.is_empty():
             logger.warning("Empty dataframe for pair %s", pair)
             return
 
@@ -1237,8 +1242,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         self,
         pair: str,
         timeframe: str,
-        dataframe: DataFrame,
-    ) -> tuple[DataFrame | None, datetime | None]:
+        dataframe: pl.DataFrame,
+    ) -> tuple[dict | None, datetime | None]:
         """
         Calculates current signal based based on the entry order or exit order
         columns of the dataframe.
@@ -1246,20 +1251,18 @@ class IStrategy(ABC, HyperStrategyMixin):
         :param pair: pair in format ANT/BTC
         :param timeframe: timeframe to use
         :param dataframe: Analyzed dataframe to get signal from.
-        :return: (None, None) or (Dataframe, latest_date) - corresponding to the last candle
+        :return: (None, None) or (dict, latest_date) - corresponding to the last candle
         """
-        if not isinstance(dataframe, DataFrame) or dataframe.empty:
+        if not isinstance(dataframe, pl.DataFrame) or dataframe.is_empty():
             logger.warning(f"Empty candle (OHLCV) data for pair {pair}")
             return None, None
 
         try:
-            latest_date_pd = dataframe["date"].max()
-            latest = dataframe.loc[dataframe["date"] == latest_date_pd].iloc[-1]
+            latest_date = dataframe["date"].max()
+            latest = dataframe.filter(pl.col("date") == latest_date).row(-1, named=True)
         except Exception as e:
             logger.warning(f"Unable to get latest candle (OHLCV) data for pair {pair} - {e}")
             return None, None
-        # Explicitly convert to datetime object to ensure the below comparison does not fail
-        latest_date: datetime = latest_date_pd.to_pydatetime()
 
         # Check if dataframe is out of date
         timeframe_minutes = timeframe_to_minutes(timeframe)
@@ -1274,7 +1277,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         return latest, latest_date
 
     def get_exit_signal(
-        self, pair: str, timeframe: str, dataframe: DataFrame, is_short: bool | None = None
+        self, pair: str, timeframe: str, dataframe: pl.DataFrame, is_short: bool | None = None
     ) -> tuple[bool, bool, str | None]:
         """
         Calculates current exit signal based based on the dataframe
@@ -1310,7 +1313,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         self,
         pair: str,
         timeframe: str,
-        dataframe: DataFrame,
+        dataframe: pl.DataFrame,
     ) -> tuple[SignalDirection | None, str | None]:
         """
         Calculates current entry signal based based on the dataframe signals
@@ -1701,7 +1704,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             pair=trade.pair, trade=trade, order=order, current_time=current_time
         )
 
-    def advise_all_indicators(self, data: dict[str, DataFrame]) -> dict[str, pl.DataFrame]:
+    def advise_all_indicators(self, data: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
         """
         Populates indicators for given candle (OHLCV) data (for multiple pairs)
         Does not run advise_entry or advise_exit!
@@ -1713,7 +1716,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         res = {}
         for pair, pair_data in data.items():
-            pair_pl = pl.from_pandas(pair_data)
+            pair_pl = pair_data
             validator = StrategyResultValidator(
                 pair_pl, warn_only=not self.disable_dataframe_checks
             )
@@ -1725,10 +1728,10 @@ class IStrategy(ABC, HyperStrategyMixin):
     def ft_advise_signals(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Call advise_entry and advise_exit and return the resulting dataframe.
-        :param dataframe: polars DataFrame containing data from exchange, as well as pre-calculated
+        :param dataframe: polars pl.DataFrame containing data from exchange, as well as pre-calculated
                           indicators
         :param metadata: Metadata dictionary with additional data (e.g. 'pair')
-        :return: polars DataFrame of candle (OHLCV) data with indicator data and signals added
+        :return: polars pl.DataFrame of candle (OHLCV) data with indicator data and signals added
 
         """
 
@@ -1736,40 +1739,17 @@ class IStrategy(ABC, HyperStrategyMixin):
         dataframe = self.advise_exit(dataframe, metadata)
         return dataframe
 
-    def _if_enabled_populate_trades(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        use_public_trades = self.config.get("exchange", {}).get("use_public_trades", False)
-        if use_public_trades:
-            pair = metadata["pair"]
-            # Build timerange from dataframe date column
-            if not dataframe.empty:
-                start_ts = dt_ts(dataframe["date"].iloc[0])
-                end_ts = dt_ts(dataframe["date"].iloc[-1])
-                timerange = TimeRange("date", "date", startts=start_ts, stopts=end_ts)
-            else:
-                timerange = None
-
-            trades = self.dp.trades(pair=pair, copy=False, timerange=timerange)
-
-            cached_grouped_trades: DataFrame | None = self._cached_grouped_trades_per_pair.get(pair)
-            dataframe, cached_grouped_trades = populate_dataframe_with_trades(
-                cached_grouped_trades, self.config, dataframe, trades
-            )
-
-            # dereference old cache
-            if pair in self._cached_grouped_trades_per_pair:
-                del self._cached_grouped_trades_per_pair[pair]
-            self._cached_grouped_trades_per_pair[pair] = cached_grouped_trades
-
-            logger.debug("Populated dataframe with trades.")
+    def _if_enabled_populate_trades(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
+        # Live-only: orderflow population from public trades. Not used in backtesting.
         return dataframe
 
     def advise_indicators(self, dataframe: pl.DataFrame, metadata: dict) -> pl.DataFrame:
         """
         Populate indicators that will be used in the Buy, Sell, short, exit_short strategy
         This method should not be overridden.
-        :param dataframe: polars DataFrame with data from the exchange
+        :param dataframe: polars pl.DataFrame with data from the exchange
         :param metadata: Additional information, like the currently traded pair
-        :return: a polars DataFrame with all mandatory indicators for the strategies
+        :return: a polars pl.DataFrame with all mandatory indicators for the strategies
         """
         logger.debug(f"Populating indicators for pair {metadata.get('pair')}.")
 
@@ -1780,10 +1760,10 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         Based on TA indicators, populates the entry order signal for the given dataframe
         This method should not be overridden.
-        :param dataframe: polars DataFrame
+        :param dataframe: polars pl.DataFrame
         :param metadata: Additional information dictionary, with details like the
             currently traded pair
-        :return: polars DataFrame with buy column
+        :return: polars pl.DataFrame with buy column
         """
 
         logger.debug(f"Populating enter signals for pair {metadata.get('pair')}.")
@@ -1800,10 +1780,10 @@ class IStrategy(ABC, HyperStrategyMixin):
         """
         Based on TA indicators, populates the exit order signal for the given dataframe
         This method should not be overridden.
-        :param dataframe: polars DataFrame
+        :param dataframe: polars pl.DataFrame
         :param metadata: Additional information dictionary, with details like the
             currently traded pair
-        :return: polars DataFrame with exit column
+        :return: polars pl.DataFrame with exit column
         """
         # Initialize exit_tag column
         if "exit_tag" not in dataframe.columns:

@@ -12,7 +12,6 @@ from decimal import Decimal
 
 from numpy import isnan, nan
 import polars as pl
-from pandas import DataFrame, Series
 
 from freqtrade import constants
 from freqtrade.configuration import TimeRange, validate_config_consistency
@@ -132,7 +131,7 @@ class Backtesting:
         self.run_ids: dict[str, str] = {}
         self.strategylist: list[IStrategy] = []
         self.all_bt_content: dict[str, BacktestContentType] = {}
-        self.analysis_results: dict[str, dict[str, DataFrame]] = {
+        self.analysis_results: dict[str, dict[str, pl.DataFrame]] = {
             "signals": {},
             "rejected": {},
             "exited": {},
@@ -243,8 +242,8 @@ class Backtesting:
 
         else:
             self.timeframe_detail_td = timedelta(seconds=0)
-        self.detail_data: dict[str, DataFrame] = {}
-        self.futures_data: dict[str, DataFrame] = {}
+        self.detail_data: dict[str, pl.DataFrame] = {}
+        self.futures_data: dict[str, pl.DataFrame] = {}
 
     def init_backtest(self):
         self.reset_backtest()
@@ -272,7 +271,7 @@ class Backtesting:
 
         self.strategy.ft_bot_start()
 
-    def load_bt_data(self) -> tuple[dict[str, DataFrame], TimeRange]:
+    def load_bt_data(self) -> tuple[dict[str, pl.DataFrame], TimeRange]:
         """
         Loads backtest data and returns the data combined with the timerange
         as tuple.
@@ -1521,19 +1520,21 @@ class Backtesting:
         current_detail_time: datetime = row[DATE_IDX]
         exit_candle_end = current_detail_time + self.timeframe_td
         detail_data = self.detail_data[pair]
-        detail_data = detail_data.loc[
-            (detail_data["date"] >= current_detail_time) & (detail_data["date"] < exit_candle_end)
-        ].copy()
+        detail_data = detail_data.filter(
+            (pl.col("date") >= current_detail_time) & (pl.col("date") < exit_candle_end)
+        )
 
         if len(detail_data) == 0:
             return None
-        detail_data.loc[:, "enter_long"] = row[LONG_IDX]
-        detail_data.loc[:, "exit_long"] = row[ELONG_IDX]
-        detail_data.loc[:, "enter_short"] = row[SHORT_IDX]
-        detail_data.loc[:, "exit_short"] = row[ESHORT_IDX]
-        detail_data.loc[:, "enter_tag"] = row[ENTER_TAG_IDX]
-        detail_data.loc[:, "exit_tag"] = row[EXIT_TAG_IDX]
-        return detail_data[HEADERS].values.tolist()
+        detail_data = detail_data.with_columns(
+            pl.lit(row[LONG_IDX]).alias("enter_long"),
+            pl.lit(row[ELONG_IDX]).alias("exit_long"),
+            pl.lit(row[SHORT_IDX]).alias("enter_short"),
+            pl.lit(row[ESHORT_IDX]).alias("exit_short"),
+            pl.lit(row[ENTER_TAG_IDX]).alias("enter_tag"),
+            pl.lit(row[EXIT_TAG_IDX]).alias("exit_tag"),
+        )
+        return detail_data.select(HEADERS).rows()
 
     def _time_generator(self, start_date: datetime, end_date: datetime):
         current_time = start_date + self.timeframe_td
@@ -1823,7 +1824,7 @@ class Backtesting:
         }
 
     def backtest_one_strategy(
-        self, strat: IStrategy, data: dict[str, DataFrame], timerange: TimeRange
+        self, strat: IStrategy, data: dict[str, pl.DataFrame], timerange: TimeRange
     ):
         self.progress.init_step(BacktestState.ANALYZE, 0)
         strategy_name = strat.get_strategy_name()
@@ -1910,7 +1911,7 @@ class Backtesting:
         """
         Run backtesting end-to-end
         """
-        data: dict[str, DataFrame] = {}
+        data: dict[str, pl.DataFrame] = {}
 
         data, timerange = self.load_bt_data()
         logger.info("Dataload complete. Calculating indicators")

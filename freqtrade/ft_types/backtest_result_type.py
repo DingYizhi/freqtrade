@@ -1,7 +1,7 @@
 from copy import deepcopy
 from typing import Any, cast
 
-from pandas import DataFrame
+import polars as pl
 from typing_extensions import TypedDict
 
 from freqtrade.constants import Config
@@ -42,7 +42,7 @@ class BacktestHistoryEntryType(BacktestMetadataType):
 
 
 class BacktestContentTypeIcomplete(TypedDict, total=False):
-    results: DataFrame
+    results: pl.DataFrame
     config: Config
     locks: Any
     rejected_signals: int

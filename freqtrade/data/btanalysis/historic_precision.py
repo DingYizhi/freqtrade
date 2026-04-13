@@ -1,6 +1,5 @@
 import numpy as np
 import polars as pl
-from pandas import DataFrame
 
 
 class TickSizeLookup:
@@ -20,13 +19,17 @@ class TickSizeLookup:
         return self._values[idx]
 
 
-def get_tick_size_over_time(candles: DataFrame) -> TickSizeLookup:
+def get_tick_size_over_time(candles) -> TickSizeLookup:
     """
     Calculate the number of significant digits for candles over time.
     Uses the monthly maximum of the number of significant digits.
     Returns a TickSizeLookup for fast asof-style queries.
     """
-    df = pl.from_pandas(candles[["date", "open", "high", "low", "close"]])
+    cols = ["date", "open", "high", "low", "close"]
+    if isinstance(candles, pl.DataFrame):
+        df = candles.select(cols)
+    else:
+        df = pl.from_pandas(candles[cols])
 
     # Vectorized: cast float to string, extract significant decimal digits count
     count_exprs = []

@@ -3,7 +3,7 @@ import operator
 from datetime import datetime
 from pathlib import Path
 
-from pandas import DataFrame
+import polars as pl
 
 from freqtrade.configuration import TimeRange
 from freqtrade.data.converter import clean_ohlcv_dataframe
@@ -27,7 +27,7 @@ def load_pair_history(
     data_format: str | None = None,
     data_handler: IDataHandler | None = None,
     candle_type: CandleType = CandleType.SPOT,
-) -> DataFrame:
+) -> pl.DataFrame:
     """
     Load cached ohlcv history for the given pair.
 
@@ -40,9 +40,8 @@ def load_pair_history(
     :param drop_incomplete: Drop last candle assuming it may be incomplete.
     :param startup_candles: Additional candles to load at the start of the period
     :param data_handler: Initialized data-handler to use.
-                         Will be initialized from data_format if not set
     :param candle_type: Any of the enum CandleType (must match trading mode!)
-    :return: DataFrame with ohlcv data, or empty DataFrame
+    :return: polars DataFrame with ohlcv data, or empty DataFrame
     """
     data_handler = get_datahandler(datadir, data_format, data_handler)
 
@@ -69,7 +68,7 @@ def load_data(
     data_format: str = "feather",
     candle_type: CandleType = CandleType.SPOT,
     user_futures_funding_rate: int | None = None,
-) -> dict[str, DataFrame]:
+) -> dict[str, pl.DataFrame]:
     """
     Load ohlcv history data for a list of pairs.
 
@@ -80,11 +79,11 @@ def load_data(
     :param fill_up_missing: Fill missing values with "No action"-candles
     :param startup_candles: Additional candles to load at the start of the period
     :param fail_without_data: Raise OperationalException if no data is found.
-    :param data_format: Data format which should be used. Defaults to json
+    :param data_format: Data format which should be used. Defaults to feather
     :param candle_type: Any of the enum CandleType (must match trading mode!)
-    :return: dict(<pair>:<Dataframe>)
+    :return: dict(<pair>:<polars DataFrame>)
     """
-    result: dict[str, DataFrame] = {}
+    result: dict[str, pl.DataFrame] = {}
     if startup_candles > 0 and timerange:
         logger.debug(f"Using indicator startup period: {startup_candles} ...")
 
@@ -101,36 +100,30 @@ def load_data(
             data_handler=data_handler,
             candle_type=candle_type,
         )
-        if not hist.empty:
+        if not hist.is_empty():
             result[pair] = hist
         else:
             if candle_type is CandleType.FUNDING_RATE and user_futures_funding_rate is not None:
                 logger.warning(f"{pair} using user specified [{user_futures_funding_rate}]")
             elif candle_type not in (CandleType.SPOT, CandleType.FUTURES):
-                result[pair] = DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
+                result[pair] = pl.DataFrame(schema={"date": pl.Datetime("us", "UTC"), "open": pl.Float64, "close": pl.Float64, "high": pl.Float64, "low": pl.Float64, "volume": pl.Float64})
 
     if fail_without_data and not result:
         raise OperationalException("No data found. Terminating.")
     return result
 
 
-def get_timerange(data: dict) -> tuple[datetime, datetime]:
+def get_timerange(data: dict[str, pl.DataFrame]) -> tuple[datetime, datetime]:
     """
     Get the maximum common timerange for the given backtest data.
 
-    :param data: dictionary with preprocessed backtesting data (polars or pandas DataFrames)
+    :param data: dictionary with preprocessed backtesting data (polars DataFrames)
     :return: tuple containing min_date, max_date
     """
-    import polars as pl
-
     timeranges = []
     for frame in data.values():
-        if isinstance(frame, pl.DataFrame):
-            min_dt = frame["date"].min()
-            max_dt = frame["date"].max()
-        else:
-            min_dt = frame["date"].min().to_pydatetime()
-            max_dt = frame["date"].max().to_pydatetime()
+        min_dt = frame["date"].min()
+        max_dt = frame["date"].max()
         timeranges.append((min_dt, max_dt))
     return (
         min(timeranges, key=operator.itemgetter(0))[0],
@@ -139,12 +132,12 @@ def get_timerange(data: dict) -> tuple[datetime, datetime]:
 
 
 def validate_backtest_data(
-    data: DataFrame, pair: str, min_date: datetime, max_date: datetime, timeframe_min: int
+    data: pl.DataFrame, pair: str, min_date: datetime, max_date: datetime, timeframe_min: int
 ) -> bool:
     """
     Validates preprocessed backtesting data for missing values and shows warnings about it that.
 
-    :param data: preprocessed backtesting data (as DataFrame)
+    :param data: preprocessed backtesting data (polars DataFrame)
     :param pair: pair used for log output.
     :param min_date: start-date of the data
     :param max_date: end-date of the data
